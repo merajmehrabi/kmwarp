@@ -171,6 +171,7 @@ pub async fn run_server(bind: SocketAddr, peer_name: &str) -> anyhow::Result<()>
     info!(addr = %local_addr, "kmwarp-server listening on {local_addr}");
 
     let peer_name: Arc<str> = Arc::from(peer_name);
+    let mod_remap: Arc<kmwarp_core::modmap::ModRemap> = Arc::new(load_mod_remap_or_default());
 
     loop {
         let (stream, remote) = match listener.accept().await {
@@ -181,11 +182,45 @@ pub async fn run_server(bind: SocketAddr, peer_name: &str) -> anyhow::Result<()>
             }
         };
         let peer_name = Arc::clone(&peer_name);
+        let mod_remap = Arc::clone(&mod_remap);
         tokio::spawn(async move {
-            if let Err(e) = handle_peer(stream, remote, peer_name).await {
+            if let Err(e) = handle_peer(stream, remote, peer_name, mod_remap).await {
                 warn!(peer = %remote, error = %e, "peer session ended with error");
             }
         });
+    }
+}
+
+/// Load `~/.config/kmwarp/config.toml` and return the configured
+/// `[modifiers]` section. Falls back to `ModRemap::default()`
+/// (Cmd→Ctrl, Option→Alt) on any error — missing file, parse failure,
+/// unresolvable home directory — and logs a `warn!` so the operator
+/// can see why their custom config didn't apply.
+///
+/// Loaded once at server startup (not per-peer) because v1 is single-
+/// peer and config reload at runtime is a v1.1 concern. The returned
+/// `ModRemap` is wrapped in an `Arc` by the caller for the per-peer
+/// spawn.
+fn load_mod_remap_or_default() -> kmwarp_core::modmap::ModRemap {
+    use kmwarp_core::config::Config;
+    match Config::load_default() {
+        Ok(cfg) => {
+            info!(
+                cmd = ?cfg.modifiers.cmd,
+                option = ?cfg.modifiers.option,
+                path = ?Config::default_config_path(),
+                "loaded [modifiers] from config"
+            );
+            cfg.modifiers
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = ?Config::default_config_path(),
+                "failed to load config; using default ModRemap (Cmd→Ctrl, Option→Alt)"
+            );
+            kmwarp_core::modmap::ModRemap::default()
+        }
     }
 }
 
@@ -195,6 +230,7 @@ async fn handle_peer(
     stream: TcpStream,
     remote: SocketAddr,
     server_peer_name: Arc<str>,
+    mod_remap: Arc<kmwarp_core::modmap::ModRemap>,
 ) -> Result<(), ServerError> {
     info!(peer = %remote, "peer connected");
 
@@ -269,6 +305,7 @@ async fn handle_peer(
         tx_out.clone(),
         screen_px.0,
         std::sync::Arc::clone(&held),
+        Arc::clone(&mod_remap),
     )
     .await;
 
@@ -679,6 +716,7 @@ async fn spawn_input_brain(
     tx_out: mpsc::Sender<Message>,
     screen_w_px: u16,
     held: std::sync::Arc<std::sync::Mutex<kmwarp_core::stuck_keys::HeldKeys>>,
+    mod_remap: Arc<kmwarp_core::modmap::ModRemap>,
 ) -> Option<mpsc::Sender<BrainInput>> {
     use crate::platform::macos::MacInputSource;
 
@@ -716,6 +754,7 @@ async fn spawn_input_brain(
         tx_out,
         screen_w_px,
         held,
+        mod_remap,
     ));
 
     Some(brain_tx)
@@ -776,6 +815,7 @@ async fn edge_brain_task(
     tx_out: mpsc::Sender<Message>,
     screen_w_px: u16,
     held: std::sync::Arc<std::sync::Mutex<kmwarp_core::stuck_keys::HeldKeys>>,
+    mod_remap: Arc<kmwarp_core::modmap::ModRemap>,
 ) -> TaskExit {
     use kmwarp_core::edge::{EdgeConfig, StateMachine};
 
@@ -791,10 +831,6 @@ async fn edge_brain_task(
     };
     let mut sm = StateMachine::new(cfg);
     let mut sink = crate::platform::macos::inject::MacInputSink::new();
-    // M7 modifier remap. v1.0 of M7 wires `ModRemap::default()`
-    // (Cmd→Ctrl, Option→Alt); the M7 follow-up commit swaps in the
-    // value loaded from `~/.config/kmwarp/config.toml`.
-    let mod_remap = kmwarp_core::modmap::ModRemap::default();
 
     let epoch = Instant::now();
     debug!(peer = %remote, screen_w_px, "edge_brain online (LocalActive)");
