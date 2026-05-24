@@ -20,6 +20,25 @@
 //!
 //! Expected: the mouse cursor traces a smooth circle for ~5 seconds, then
 //! a final-summary log line is emitted and the process exits.
+//!
+//! M5 acceptance check (cross-machine — no dedicated demo binary):
+//!
+//! On the **macOS** box:
+//!
+//! ```sh
+//! cargo run -p kmwarp-server
+//! ```
+//!
+//! On the **Windows** box, with Notepad focused:
+//!
+//! ```powershell
+//! $env:KMWARP_CONNECT="<mac-ip>:51423"; cargo run -p kmwarp-client
+//! ```
+//!
+//! Expected: typing the alphabet, digits, and common punctuation on the
+//! Mac keyboard produces the corresponding characters in Windows Notepad.
+//! Deferred keys (media, Fn-layer, IME / dead keys) are tracked in
+//! IDEAS.md per PLAN.md §M5.
 
 use std::env;
 use std::net::SocketAddr;

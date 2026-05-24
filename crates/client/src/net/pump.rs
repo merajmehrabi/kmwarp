@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use kmwarp_core::wire::{apply_mouse_to_sink, Message};
+use kmwarp_core::wire::{apply_key_to_sink, apply_mouse_to_sink, Message};
 use kmwarp_core::InputSink;
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, trace, warn};
@@ -55,16 +55,19 @@ pub async fn injector_loop<S: InputSink + Send>(
     loop {
         let msg = reader.read_frame().await?;
         notify.notify_one();
+        // Mouse-first because mouse events dominate the steady-state
+        // packet rate (cursor motion is continuous; keypresses are rare).
+        // The shared dispatch helpers in `core::wire::convert` keep the
+        // byte conventions identical to the server's encode path.
         if apply_mouse_to_sink(&msg, &mut sink) {
+            continue;
+        }
+        if apply_key_to_sink(&msg, &mut sink) {
             continue;
         }
         match msg {
             Message::Heartbeat { seq } => {
                 trace!(seq, "received Heartbeat");
-            }
-            Message::KeyEvent { .. } => {
-                // M5 wires this in; for M4 we drop silently to avoid noise.
-                trace!(?msg, "received KeyEvent (M5 territory; ignoring)");
             }
             Message::EchoPing { ts_ns } => {
                 let response = Message::EchoPong { ts_ns };
@@ -90,11 +93,12 @@ pub async fn injector_loop<S: InputSink + Send>(
             | Message::ReleaseControl { .. } => {
                 trace!(?msg, "received frame; M6/M8 will handle");
             }
-            // `apply_mouse_to_sink` covered MouseMoveRel / MouseButton /
-            // MouseWheel above; the compiler can't tell, so fall through.
+            // `apply_mouse_to_sink` / `apply_key_to_sink` covered these
+            // above; the compiler can't tell, so fall through.
             Message::MouseMoveRel { .. }
             | Message::MouseButton { .. }
             | Message::MouseWheel { .. } => unreachable!("handled by apply_mouse_to_sink"),
+            Message::KeyEvent { .. } => unreachable!("handled by apply_key_to_sink"),
         }
     }
 }
