@@ -34,17 +34,25 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::Context;
 use kmwarp_core::clipboard::EchoGuard;
+use kmwarp_core::tls::{cert, PinStore};
 use kmwarp_core::wire::{Message, PROTO_VERSION};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinSet;
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
+use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::error::ClientError;
-use crate::net::{encoder_loop, injector_loop, Connection, FrameReader, FrameWriter};
+use crate::net::{
+    encoder_loop, injector_loop, run_client_pairing_flow, Connection, FrameReader, FrameWriter,
+};
 use crate::sink::{build_default_sink, DefaultSink};
+use crate::tls::{
+    build_client_config, default_config_dir, init_crypto_provider, pin_path, pinned_server_name,
+};
 
 /// Heartbeat cadence; spec §M1 mandates 500 ms.
 const HEARTBEAT_PERIOD: Duration = Duration::from_millis(500);
@@ -68,13 +76,52 @@ const OUTBOUND_CHANNEL_BOUND: usize = 256;
 /// mode (connect refused, socket dropped, peer silence) is recoverable
 /// via reconnect.
 pub async fn run_client(connect: SocketAddr, peer_name: &str) -> anyhow::Result<()> {
+    // M9 bootstrap: install crypto provider, resolve config dir,
+    // load-or-generate cert+key, build the pin store. `KMWARP_REPAIR=1`
+    // wipes the existing pin so the next connect re-enters pairing.
+    init_crypto_provider();
+    let config_dir = default_config_dir()
+        .context("could not resolve OS-conventional config directory for TLS materials")?;
+    let (cert_path, key_path) = cert::default_paths_in(&config_dir);
+    let cert_bundle = if cert_path.exists() && key_path.exists() {
+        cert::load_from_disk(&cert_path, &key_path).context("loading cert / key from disk")?
+    } else {
+        info!(
+            ?cert_path,
+            ?key_path,
+            "no cert / key on disk; generating self-signed pair"
+        );
+        let bundle = cert::generate_self_signed().context("generating self-signed cert")?;
+        cert::save_to_disk(&bundle, &cert_path, &key_path).context("saving cert / key to disk")?;
+        bundle
+    };
+    let pin_store = Arc::new(PinStore::new(pin_path(&config_dir)));
+    if std::env::var("KMWARP_REPAIR").as_deref() == Ok("1") {
+        info!(
+            path = %pin_store.path().display(),
+            "KMWARP_REPAIR=1 set; deleting existing peer.pin"
+        );
+        if let Err(e) = pin_store.forget() {
+            warn!(error = %e, "could not delete peer.pin; continuing");
+        }
+    }
+
     let peer_name_arc: Arc<str> = Arc::from(peer_name);
+    let cert_bundle = Arc::new(cert_bundle);
 
     loop {
         let stream = connect_with_backoff(connect).await;
         info!(addr = %connect, "connected to kmwarp-server at {connect}");
 
-        match run_one_session(connect, stream, &peer_name_arc).await {
+        match run_one_session(
+            connect,
+            stream,
+            &peer_name_arc,
+            Arc::clone(&cert_bundle),
+            Arc::clone(&pin_store),
+        )
+        .await
+        {
             Ok(()) => info!(addr = %connect, "session ended; reconnecting"),
             Err(ClientError::HandshakeRejected) => {
                 error!(addr = %connect, "server rejected handshake; aborting");
@@ -117,8 +164,60 @@ async fn run_one_session(
     addr: SocketAddr,
     stream: TcpStream,
     peer_name: &Arc<str>,
+    cert_bundle: Arc<cert::CertBundle>,
+    pin_store: Arc<PinStore>,
 ) -> Result<(), ClientError> {
-    let mut conn = Connection::new(stream)?;
+    // Set TCP_NODELAY on the raw socket BEFORE the TLS handshake.
+    stream.set_nodelay(true)?;
+
+    // M9: load the current pin state per-session so a deleted pin file
+    // mid-run re-enters pairing on the next reconnect attempt.
+    let pinned = match pin_store.load() {
+        Ok(p) => p,
+        Err(e) => {
+            error!(
+                addr = %addr,
+                error = %e,
+                "pin file corrupt; refusing connection (delete peer.pin and re-pair)"
+            );
+            return Ok(());
+        }
+    };
+    let client_config =
+        match build_client_config(&cert_bundle.cert_der, &cert_bundle.private_key_der, pinned) {
+            Ok(c) => c,
+            Err(e) => {
+                error!(addr = %addr, error = %e, "could not build TLS client config");
+                return Ok(());
+            }
+        };
+    let connector = TlsConnector::from(client_config);
+    let server_name = pinned_server_name();
+    let tls = match connector.connect(server_name, stream).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(addr = %addr, error = %e, "TLS handshake failed (pin mismatch?)");
+            return Ok(());
+        }
+    };
+    info!(
+        addr = %addr,
+        mode = if pinned.is_some() { "pin" } else { "pairing" },
+        "TLS handshake complete"
+    );
+    let mut conn = Connection::from_io(tls);
+
+    // M9 pairing: if no pin yet, run the in-stream pairing flow BEFORE
+    // the normal Hello / HelloAck.
+    if pinned.is_none() {
+        match run_client_pairing_flow(&mut conn, &cert_bundle.cert_der, &pin_store).await {
+            Ok(()) => info!(addr = %addr, "pairing succeeded"),
+            Err(e) => {
+                warn!(addr = %addr, error = %e, "pairing failed; will retry on reconnect");
+                return Ok(());
+            }
+        }
+    }
 
     conn.write_frame(&Message::Hello {
         proto_version: PROTO_VERSION,

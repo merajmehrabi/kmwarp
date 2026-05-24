@@ -89,18 +89,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use kmwarp_core::tls::{cert, PinStore};
 use kmwarp_core::wire::Message;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinSet;
 use tokio::time::{interval, timeout, MissedTickBehavior};
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, trace, warn};
 
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicBool;
 
 use crate::error::ServerError;
-use crate::net::{encoder_loop, Connection, FrameReader};
+use crate::net::{encoder_loop, run_server_pairing_flow, Connection, FrameReader};
+use crate::tls::{build_server_config, default_config_dir, init_crypto_provider, pin_path};
 
 /// Edge-state-machine input. Fed by the source forwarder (`Source`
 /// variant) and by `reader_task` (`WireMessage` variant — currently
@@ -177,6 +180,37 @@ const LATENCY_PROBE_SAMPLES_PER_REPORT: u64 = 1000;
 /// Returns `Err` only if the initial bind fails. Per-peer failures are
 /// logged inside the spawned task and isolated to that peer.
 pub async fn run_server(bind: SocketAddr, peer_name: &str) -> anyhow::Result<()> {
+    // M9 bootstrap: install the rustls crypto provider, resolve the
+    // config dir, load or generate the self-signed cert + key, build a
+    // PinStore. `KMWARP_REPAIR=1` deletes any existing pin so the next
+    // connect re-enters pairing mode.
+    init_crypto_provider();
+    let config_dir = default_config_dir()
+        .context("could not resolve OS-conventional config directory for TLS materials")?;
+    let (cert_path, key_path) = cert::default_paths_in(&config_dir);
+    let cert_bundle = if cert_path.exists() && key_path.exists() {
+        cert::load_from_disk(&cert_path, &key_path).context("loading cert / key from disk")?
+    } else {
+        info!(
+            ?cert_path,
+            ?key_path,
+            "no cert / key on disk; generating self-signed pair"
+        );
+        let bundle = cert::generate_self_signed().context("generating self-signed cert")?;
+        cert::save_to_disk(&bundle, &cert_path, &key_path).context("saving cert / key to disk")?;
+        bundle
+    };
+    let pin_store = Arc::new(PinStore::new(pin_path(&config_dir)));
+    if std::env::var("KMWARP_REPAIR").as_deref() == Ok("1") {
+        info!(
+            path = %pin_store.path().display(),
+            "KMWARP_REPAIR=1 set; deleting existing peer.pin"
+        );
+        if let Err(e) = pin_store.forget() {
+            warn!(error = %e, "could not delete peer.pin; continuing");
+        }
+    }
+
     let listener = TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding kmwarp-server to {bind}"))?;
@@ -185,6 +219,7 @@ pub async fn run_server(bind: SocketAddr, peer_name: &str) -> anyhow::Result<()>
 
     let peer_name: Arc<str> = Arc::from(peer_name);
     let mod_remap: Arc<kmwarp_core::modmap::ModRemap> = Arc::new(load_mod_remap_or_default());
+    let cert_bundle = Arc::new(cert_bundle);
 
     loop {
         let (stream, remote) = match listener.accept().await {
@@ -196,8 +231,12 @@ pub async fn run_server(bind: SocketAddr, peer_name: &str) -> anyhow::Result<()>
         };
         let peer_name = Arc::clone(&peer_name);
         let mod_remap = Arc::clone(&mod_remap);
+        let cert_bundle = Arc::clone(&cert_bundle);
+        let pin_store = Arc::clone(&pin_store);
         tokio::spawn(async move {
-            if let Err(e) = handle_peer(stream, remote, peer_name, mod_remap).await {
+            if let Err(e) =
+                handle_peer(stream, remote, peer_name, mod_remap, cert_bundle, pin_store).await
+            {
                 warn!(peer = %remote, error = %e, "peer session ended with error");
             }
         });
@@ -244,10 +283,66 @@ async fn handle_peer(
     remote: SocketAddr,
     server_peer_name: Arc<str>,
     mod_remap: Arc<kmwarp_core::modmap::ModRemap>,
+    cert_bundle: Arc<cert::CertBundle>,
+    pin_store: Arc<PinStore>,
 ) -> Result<(), ServerError> {
     info!(peer = %remote, "peer connected");
 
-    let mut conn = Connection::new(stream)?;
+    // Set TCP_NODELAY on the underlying socket BEFORE the TLS
+    // handshake. `Connection::from_io` doesn't touch socket options
+    // because the stream type is opaque at that level.
+    stream.set_nodelay(true)?;
+
+    // M9: load the current pin state from disk per-accept (so a deleted
+    // pin file mid-run re-enters pairing on the next accept without a
+    // restart). Build the rustls ServerConfig accordingly.
+    let pinned = match pin_store.load() {
+        Ok(p) => p,
+        Err(e) => {
+            error!(
+                peer = %remote,
+                error = %e,
+                "pin file corrupt; refusing connection (delete peer.pin and re-pair)"
+            );
+            return Ok(());
+        }
+    };
+    let server_config =
+        match build_server_config(&cert_bundle.cert_der, &cert_bundle.private_key_der, pinned) {
+            Ok(c) => c,
+            Err(e) => {
+                error!(peer = %remote, error = %e, "could not build TLS server config");
+                return Ok(());
+            }
+        };
+    let acceptor = TlsAcceptor::from(server_config);
+    let tls = match acceptor.accept(stream).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(peer = %remote, error = %e, "TLS handshake failed (pin mismatch?)");
+            return Ok(());
+        }
+    };
+    info!(
+        peer = %remote,
+        mode = if pinned.is_some() { "pin" } else { "pairing" },
+        "TLS handshake complete"
+    );
+    let mut conn = Connection::from_io(tls);
+
+    // M9 pairing: if no pin on disk, run the in-stream pairing flow
+    // BEFORE the normal Hello/HelloAck. Succeeds → pin written → subsequent
+    // connects use pin mode. Fails → drop the session; the client will
+    // reconnect and re-pair.
+    if pinned.is_none() {
+        match run_server_pairing_flow(&mut conn, &cert_bundle.cert_der, &pin_store).await {
+            Ok(()) => info!(peer = %remote, "pairing succeeded"),
+            Err(e) => {
+                warn!(peer = %remote, error = %e, "pairing failed; closing connection");
+                return Ok(());
+            }
+        }
+    }
 
     let hello = conn.read_frame().await?;
     match &hello {
