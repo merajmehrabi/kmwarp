@@ -228,8 +228,36 @@ fn callback(
         // loop will stop shortly via the shutdown watcher.
         let _ = tx.send(ev);
     }
+    // M6: every mouse-motion event also emits an absolute `CursorAt` so
+    // the edge state machine can see the cursor cross the right edge.
+    // CursorAt is server-internal — never on the wire — but the SM
+    // distinguishes between "you moved by (dx,dy)" and "you're now at
+    // (x,y)" because crossings are detected against absolute screen
+    // coords, not deltas.
+    if is_mouse_motion(etype) {
+        let loc = event.location();
+        // `CGPoint` is logical points; PLAN.md HiDPI normalization is a
+        // M11 follow-up. SM treats the value as opaque screen units.
+        let _ = tx.send(SourceEvent::CursorAt {
+            x: loc.x as i32,
+            y: loc.y as i32,
+        });
+    }
     // Pass-through: M2 never swallows. M6 will revisit.
     None
+}
+
+/// Mouse-motion event types — the only ones whose absolute location
+/// matters for the edge state machine. Button up/down events also carry
+/// a location but the spec triggers crossings off motion only.
+fn is_mouse_motion(etype: CGEventType) -> bool {
+    matches!(
+        etype,
+        CGEventType::MouseMoved
+            | CGEventType::LeftMouseDragged
+            | CGEventType::RightMouseDragged
+            | CGEventType::OtherMouseDragged
+    )
 }
 
 fn interest_mask() -> Vec<CGEventType> {
