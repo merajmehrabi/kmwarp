@@ -4,6 +4,7 @@
 //! (`kmwarp-server`) and Windows client (`kmwarp-client`) bring those in
 //! and implement the traits exposed here.
 
+pub mod edge;
 pub mod error;
 pub mod hid;
 pub mod platform;

@@ -568,6 +568,7 @@ dependencies = [
  "bytes",
  "proptest",
  "serde",
+ "smallvec",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
