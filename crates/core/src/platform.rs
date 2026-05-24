@@ -34,9 +34,15 @@ pub enum MouseButton {
 
 /// Modifier bitmask carried alongside every `KeyEvent`.
 ///
-/// Bit assignments match the spec's wire-format modifier byte; the exact
-/// mapping is finalized in M5 once HID translation lands. The byte is
-/// reserved here so M2/M3 can already typecheck against it.
+/// Wire byte layout (finalized M5):
+/// - bit 0: `SHIFT` (either side)
+/// - bit 1: `CTRL`  (either side)
+/// - bit 2: `ALT`   (Option on macOS)
+/// - bit 3: `META`  (Cmd on macOS, Win key on Windows)
+/// - bits 4–7: reserved, must be zero on wire
+///
+/// [`ModMask::from_wire`] / [`ModMask::to_wire`] mask off the reserved bits
+/// so a non-conforming peer can't smuggle data through them.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModMask(pub u8);
 
@@ -47,6 +53,10 @@ impl ModMask {
     /// `Cmd` on macOS, `Win` on Windows. Remap is a config-time concern
     /// (see PLAN.md §Config `[modifiers]`), not a wire-format concern.
     pub const META: ModMask = ModMask(1 << 3);
+
+    /// Mask of all currently-defined modifier bits. Reserved bits 4-7 are
+    /// stripped during [`from_wire`] / [`to_wire`] using this constant.
+    pub const DEFINED_BITS: u8 = 0x0F;
 
     /// True iff every bit in `other` is set in `self`.
     pub fn contains(self, other: ModMask) -> bool {
@@ -59,6 +69,21 @@ impl ModMask {
 
     pub fn remove(&mut self, other: ModMask) {
         self.0 &= !other.0;
+    }
+
+    /// Build a `ModMask` from a raw wire byte, dropping any reserved bits
+    /// (4-7) so a misbehaving or future-version peer can't slip extra bits
+    /// past us. Round-tripping a wire byte through `from_wire().to_wire()`
+    /// is idempotent and equal to `byte & 0x0F`.
+    pub const fn from_wire(byte: u8) -> ModMask {
+        ModMask(byte & Self::DEFINED_BITS)
+    }
+
+    /// Project a `ModMask` to its wire byte representation, masking off
+    /// any reserved bits a caller might have set via the public `pub u8`
+    /// field.
+    pub const fn to_wire(self) -> u8 {
+        self.0 & Self::DEFINED_BITS
     }
 }
 

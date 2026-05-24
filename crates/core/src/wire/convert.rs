@@ -78,7 +78,7 @@ pub fn source_event_to_message(ev: SourceEvent) -> Option<Message> {
         } => Some(Message::KeyEvent {
             hid_usage,
             state: key_state_to_byte(state),
-            modifiers: mods.0,
+            modifiers: mods.to_wire(),
         }),
         SourceEvent::CursorAt { .. } => None,
     }
@@ -92,8 +92,9 @@ pub fn source_event_to_message(ev: SourceEvent) -> Option<Message> {
 ///
 /// Wire-byte → enum conversions are tolerant: an unknown `state` byte
 /// logs a `warn!` and drops the event rather than panicking. The
-/// `modifiers` byte is passed through verbatim — every bit pattern is a
-/// valid [`ModMask`] (its `u8` field is `pub`).
+/// `modifiers` byte goes through [`ModMask::from_wire`] so reserved bits
+/// 4-7 are silently dropped — a misbehaving peer can't smuggle data
+/// through them.
 pub fn apply_key_to_sink<S: InputSink>(msg: &Message, sink: &mut S) -> bool {
     match msg {
         Message::KeyEvent {
@@ -102,7 +103,7 @@ pub fn apply_key_to_sink<S: InputSink>(msg: &Message, sink: &mut S) -> bool {
             modifiers,
         } => {
             match byte_to_key_state(*state) {
-                Some(st) => sink.inject_key(*hid_usage, st, ModMask(*modifiers)),
+                Some(st) => sink.inject_key(*hid_usage, st, ModMask::from_wire(*modifiers)),
                 None => tracing::warn!(
                     hid_usage,
                     state = *state,
