@@ -9,5 +9,6 @@ pub mod app;
 pub mod error;
 pub mod net;
 pub mod platform;
+pub mod service;
 pub mod sink;
 pub mod tls;
