@@ -180,20 +180,18 @@ impl InputSink for WinInputSink {
         // `KeyEvent`s for shift/ctrl/alt/gui transitions, so the chord
         // bitmap on each frame is informational here. Using it would
         // double-fire modifiers.
-        let Some(sc) = kmwarp_core::hid::hid_to_scancode(hid) else {
+        let Some(sc) = kmwarp_core::hid::hid_to_windows_scancode(hid) else {
             tracing::trace!(hid, "no scancode mapping; dropping key event");
             return;
         };
-        let extended = kmwarp_core::hid::is_extended_scancode(sc);
-        let w_scan = kmwarp_core::hid::scancode_low_byte(sc);
 
         // KEYEVENTF_SCANCODE makes Windows ignore `wVk` and interpret
         // `wScan` directly — layout-independent injection, which is what
         // the wire's HID convention is designed for. KEYEVENTF_EXTENDEDKEY
         // tells the kernel "this scancode is the 0xE0-prefixed flavor";
-        // we still pass only the low byte in `wScan`.
+        // `WinScancode::code` is already just the low byte.
         let mut flags = KEYEVENTF_SCANCODE;
-        if extended {
+        if sc.extended {
             flags |= KEYEVENTF_EXTENDEDKEY;
         }
         if matches!(state, KeyState::Up) {
@@ -202,7 +200,7 @@ impl InputSink for WinInputSink {
 
         let input = keybd_input(KEYBDINPUT {
             wVk: VIRTUAL_KEY(0), // ignored when KEYEVENTF_SCANCODE is set
-            wScan: w_scan,
+            wScan: sc.code,
             dwFlags: flags,
             time: 0,
             dwExtraInfo: 0,
