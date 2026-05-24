@@ -6,8 +6,12 @@
 //! delivered by `core::InputSink` (relative deltas, button up/down, scroll,
 //! absolute warp) into one or two `SendInput` calls.
 //!
-//! Keyboard, hide/show cursor are stubbed for M3 — M5 fills keyboard, M6
-//! puts hide/show on the macOS server side.
+//! M5 added the keyboard path: `inject_key` looks the wire HID up in
+//! `core::hid::hid_to_scancode`, splits the packed scancode into a
+//! `wScan` low byte plus an optional `KEYEVENTF_EXTENDEDKEY` flag, and
+//! injects via `KEYEVENTF_SCANCODE` so the result is independent of the
+//! Windows user's keyboard layout. Hide/show cursor remain stubs — those
+//! are a server-side concern (M6 macOS `CGDisplayHide/ShowCursor`).
 //!
 //! ## SendInput semantics worth remembering
 //!
@@ -36,10 +40,12 @@ use std::mem::size_of;
 use kmwarp_core::{InputSink, KeyState, ModMask, MouseButton};
 use tracing::warn;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
     MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS,
+    VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::SetCursorPos;
 
@@ -169,10 +175,39 @@ impl InputSink for WinInputSink {
         }
     }
 
-    fn inject_key(&mut self, _hid: u16, _state: KeyState, _mods: ModMask) {
-        // M5 fills this in. Warn (don't panic) so a stray Key event during
-        // M3/M4 wiring doesn't crash the injector task.
-        warn!("inject_key called before M5 wiring; ignoring");
+    fn inject_key(&mut self, hid: u16, state: KeyState, _mods: ModMask) {
+        // `_mods` is M7 territory; the server emits separate modifier
+        // `KeyEvent`s for shift/ctrl/alt/gui transitions, so the chord
+        // bitmap on each frame is informational here. Using it would
+        // double-fire modifiers.
+        let Some(sc) = kmwarp_core::hid::hid_to_scancode(hid) else {
+            tracing::trace!(hid, "no scancode mapping; dropping key event");
+            return;
+        };
+        let extended = kmwarp_core::hid::is_extended_scancode(sc);
+        let w_scan = kmwarp_core::hid::scancode_low_byte(sc);
+
+        // KEYEVENTF_SCANCODE makes Windows ignore `wVk` and interpret
+        // `wScan` directly — layout-independent injection, which is what
+        // the wire's HID convention is designed for. KEYEVENTF_EXTENDEDKEY
+        // tells the kernel "this scancode is the 0xE0-prefixed flavor";
+        // we still pass only the low byte in `wScan`.
+        let mut flags = KEYEVENTF_SCANCODE;
+        if extended {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
+        if matches!(state, KeyState::Up) {
+            flags |= KEYEVENTF_KEYUP;
+        }
+
+        let input = keybd_input(KEYBDINPUT {
+            wVk: VIRTUAL_KEY(0), // ignored when KEYEVENTF_SCANCODE is set
+            wScan: w_scan,
+            dwFlags: flags,
+            time: 0,
+            dwExtraInfo: 0,
+        });
+        send_one(&input, "inject_key");
     }
 
     fn warp_cursor_abs(&mut self, x: i32, y: i32) {
@@ -200,6 +235,15 @@ fn mouse_input(mi: MOUSEINPUT) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 { mi },
+    }
+}
+
+/// Build an `INPUT` union holding a `KEYBDINPUT`. Mirror of
+/// [`mouse_input`] for the keyboard discriminant.
+fn keybd_input(ki: KEYBDINPUT) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki },
     }
 }
 
