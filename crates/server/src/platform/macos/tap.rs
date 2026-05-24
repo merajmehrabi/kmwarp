@@ -42,12 +42,13 @@ use async_trait::async_trait;
 use core_foundation::base::TCFType;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
-    CGEvent, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
-    EventField,
+    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType, EventField,
 };
-use kmwarp_core::platform::{InputSource, KeyState, MouseButton, SourceEvent};
+use kmwarp_core::hid::macos::macos_to_hid;
+use kmwarp_core::platform::{InputSource, KeyState, ModMask, MouseButton, SourceEvent};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use super::tap_error::TapError;
 
@@ -294,11 +295,66 @@ fn translate(etype: CGEventType, event: &CGEvent) -> Option<SourceEvent> {
                 dy: clamp_i64_to_i16(dy),
             })
         }
-        // M5 wires these in; M2 ignores them so the channel only carries
-        // mouse events for the acceptance test.
-        KeyDown | KeyUp | FlagsChanged => None,
+        KeyDown => translate_key(event, KeyState::Down),
+        KeyUp => translate_key(event, KeyState::Up),
+        // M5 second commit wires FlagsChanged through the held-keycode tracker.
+        FlagsChanged => None,
         _ => None,
     }
+}
+
+/// Translate a `kCGEventKeyDown` / `kCGEventKeyUp` event into a
+/// `SourceEvent::Key`. Returns `None` (and emits a `trace!`) when:
+///   - the event is an autorepeat (`kCGKeyboardEventAutorepeat == 1`) — per
+///     the spec's "Key repeat" gotcha, the destination OS regenerates repeats
+///     from a sustained held state, so we forward press + release only;
+///   - the macOS virtual keycode has no entry in `MACOS_VK_TO_HID` (any key
+///     outside the v1 alphanumeric / punctuation / nav / mod set).
+fn translate_key(event: &CGEvent, state: KeyState) -> Option<SourceEvent> {
+    // Autorepeat is only meaningful for KeyDown, but the field is also zero
+    // on KeyUp so we can read it unconditionally and the check is a no-op
+    // for releases. Keeps both arms symmetric.
+    if state == KeyState::Down
+        && event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0
+    {
+        return None;
+    }
+    let cg_vk = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+    let hid = match macos_to_hid(cg_vk) {
+        Some(h) => h,
+        None => {
+            trace!(?cg_vk, ?state, "unmapped macOS VK; dropping key event");
+            return None;
+        }
+    };
+    let mods = mods_from_flags(event.get_flags());
+    Some(SourceEvent::Key {
+        hid_usage: hid,
+        state,
+        mods,
+    })
+}
+
+/// Project the aggregate `CGEventFlags` value onto our cross-platform
+/// `ModMask`. Only the four chord modifiers (Shift/Control/Alt/Command)
+/// are projected; `AlphaShift` (Caps Lock latch), `Help`, `SecondaryFn`,
+/// and the numeric-pad bit are intentionally dropped — they aren't part
+/// of the wire-format modifier byte.
+fn mods_from_flags(flags: CGEventFlags) -> ModMask {
+    let mut m = ModMask::default();
+    if flags.contains(CGEventFlags::CGEventFlagShift) {
+        m.insert(ModMask::SHIFT);
+    }
+    if flags.contains(CGEventFlags::CGEventFlagControl) {
+        m.insert(ModMask::CTRL);
+    }
+    if flags.contains(CGEventFlags::CGEventFlagAlternate) {
+        m.insert(ModMask::ALT);
+    }
+    if flags.contains(CGEventFlags::CGEventFlagCommand) {
+        m.insert(ModMask::META);
+    }
+    m
 }
 
 fn other_button(event: &CGEvent) -> MouseButton {
@@ -330,5 +386,53 @@ mod tests {
         assert_eq!(clamp_i64_to_i16(-40_000), i16::MIN);
         assert_eq!(clamp_i64_to_i16(123), 123);
         assert_eq!(clamp_i64_to_i16(-123), -123);
+    }
+
+    #[test]
+    fn mods_from_flags_maps_chord_modifiers() {
+        assert_eq!(mods_from_flags(CGEventFlags::empty()), ModMask::default());
+
+        assert_eq!(
+            mods_from_flags(CGEventFlags::CGEventFlagShift),
+            ModMask::SHIFT
+        );
+        assert_eq!(
+            mods_from_flags(CGEventFlags::CGEventFlagControl),
+            ModMask::CTRL
+        );
+        assert_eq!(
+            mods_from_flags(CGEventFlags::CGEventFlagAlternate),
+            ModMask::ALT
+        );
+        assert_eq!(
+            mods_from_flags(CGEventFlags::CGEventFlagCommand),
+            ModMask::META
+        );
+
+        let all = CGEventFlags::CGEventFlagShift
+            | CGEventFlags::CGEventFlagControl
+            | CGEventFlags::CGEventFlagAlternate
+            | CGEventFlags::CGEventFlagCommand;
+        let expected = {
+            let mut m = ModMask::default();
+            m.insert(ModMask::SHIFT);
+            m.insert(ModMask::CTRL);
+            m.insert(ModMask::ALT);
+            m.insert(ModMask::META);
+            m
+        };
+        assert_eq!(mods_from_flags(all), expected);
+    }
+
+    #[test]
+    fn mods_from_flags_ignores_non_chord_bits() {
+        // AlphaShift (Caps Lock latch), Help, SecondaryFn (the Fn key),
+        // and the numeric-pad bit should not bleed into ModMask — they
+        // are not wire-format modifiers.
+        let noise = CGEventFlags::CGEventFlagAlphaShift
+            | CGEventFlags::CGEventFlagHelp
+            | CGEventFlags::CGEventFlagSecondaryFn
+            | CGEventFlags::CGEventFlagNumericPad;
+        assert_eq!(mods_from_flags(noise), ModMask::default());
     }
 }
