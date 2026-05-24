@@ -512,6 +512,7 @@ name = "kmwarp-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "core-foundation",
  "core-graphics",
