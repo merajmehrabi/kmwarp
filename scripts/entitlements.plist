@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        Entitlements for kmwarp-server's signed/notarized release.
+
+        Hardened runtime is enabled by `codesign --options runtime` in
+        build-mac.sh. The entitlements here are the minimum set needed
+        for the v1.0 feature surface:
+
+          - network.client / network.server: M1 TCP + M9 TLS connection
+            handling.
+
+        Accessibility + Input Monitoring TCC permissions are NOT
+        entitlements — they're per-user permissions granted at runtime
+        from System Settings → Privacy & Security. Entitlements only
+        cover the hardened-runtime exceptions.
+
+        Notably NOT enabled:
+          - app-sandbox: kmwarp-server is a system-level daemon that
+            needs unrestricted filesystem access for its config + pin
+            file under ~/.config/kmwarp/.
+          - JIT, executable-page-mapping, library-validation
+            disablement: we have no dynamic codegen and load only
+            system frameworks.
+    -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+</dict>
+</plist>
