@@ -10,3 +10,4 @@ pub mod error;
 pub mod net;
 pub mod platform;
 pub mod sink;
+pub mod tls;

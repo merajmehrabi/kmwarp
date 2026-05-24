@@ -1,132 +1,77 @@
-//! TLS plumbing for the client (M9).
+//! Binary-side TLS plumbing (client).
 //!
-//! Mirror of `kmwarp_server::tls`. The two are intentionally near-
-//! identical — the only real differences are:
+//! Thin wrapper over `kmwarp_core::tls`, mirror of `server::tls`.
 //!
-//!  * client implements [`ServerCertVerifier`] (validates the server's
-//!    cert) instead of `ClientCertVerifier`.
-//!  * client's TLS config carries the client cert as an *auth identity*
-//!    (`with_client_auth_cert`) so mutual TLS works.
-//!
-//! See the server-side file for the detailed design rationale (pin-mode
-//! vs pairing-mode, constant-time compare, persistence layout, etc.).
+//! What lives here:
+//! - `init_crypto_provider`: install the rustls process-default crypto
+//!   provider exactly once.
+//! - `build_client_config`: assemble a `rustls::ClientConfig` from our
+//!   cert bundle and the optional pinned server cert. Pairing mode
+//!   (`pinned == None`) uses a `PermissiveServerVerifier`.
+//! - `pinned_server_name` / `default_config_dir` / `pin_path`: helpers.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rcgen::{CertificateParams, KeyPair};
+use kmwarp_core::tls::PinnedCertVerifier;
+use kmwarp_core::TlsError;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::ClientConfig;
+use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
-use subtle::ConstantTimeEq;
-use thiserror::Error;
-use tracing::{info, warn};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+use tracing::warn;
 
-pub const CERT_FILENAME: &str = "cert.der";
-pub const KEY_FILENAME: &str = "key.der";
 pub const PIN_FILENAME: &str = "peer.pin";
 
-const CERT_VALIDITY_DAYS: i64 = 365 * 10;
-
-#[derive(Debug, Error)]
-pub enum TlsError {
-    #[error("TLS IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("cert generation failed: {0}")]
-    Rcgen(#[from] rcgen::Error),
-
-    #[error("on-disk cert / key has bad format: {0}")]
-    BadCertFormat(String),
-
-    #[error("rustls error: {0}")]
-    Rustls(#[from] rustls::Error),
-}
-
-#[derive(Clone)]
-pub struct CertBundle {
-    pub cert_der: Vec<u8>,
-    pub private_key_der: Vec<u8>,
-}
-
 pub fn init_crypto_provider() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = aws_lc_rs::default_provider().install_default();
 }
 
-pub fn load_or_generate_certs(cert_path: &Path, key_path: &Path) -> Result<CertBundle, TlsError> {
-    if cert_path.exists() && key_path.exists() {
-        let cert_der = fs::read(cert_path)?;
-        let key_der = fs::read(key_path)?;
-        return Ok(CertBundle {
-            cert_der,
-            private_key_der: key_der,
-        });
+/// Resolve the config directory. Honors the `KMWARP_CONFIG_DIR` env
+/// override (used for localhost smoke tests where the server and
+/// client must NOT share certs) before falling back to the parent of
+/// `Config::default_config_path()`.
+pub fn default_config_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("KMWARP_CONFIG_DIR") {
+        return Some(PathBuf::from(dir));
     }
-    info!(
-        ?cert_path,
-        ?key_path,
-        "no cert / key on disk; generating self-signed pair"
-    );
-    let bundle = generate_self_signed()?;
-    persist(&bundle, cert_path, key_path)?;
-    Ok(bundle)
+    kmwarp_core::config::Config::default_config_path()?
+        .parent()
+        .map(|p| p.to_path_buf())
 }
 
-fn generate_self_signed() -> Result<CertBundle, TlsError> {
-    let mut params = CertificateParams::new(vec!["kmwarp".to_string()])?;
-    let now = time::OffsetDateTime::now_utc();
-    params.not_before = now;
-    params.not_after = now + time::Duration::days(CERT_VALIDITY_DAYS);
-    let key_pair = KeyPair::generate()?;
-    let cert = params.self_signed(&key_pair)?;
-    Ok(CertBundle {
-        cert_der: cert.der().to_vec(),
-        private_key_der: key_pair.serialize_der(),
-    })
+pub fn pin_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(PIN_FILENAME)
 }
 
-fn persist(bundle: &CertBundle, cert_path: &Path, key_path: &Path) -> Result<(), TlsError> {
-    if let Some(parent) = cert_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    write_with_mode(cert_path, &bundle.cert_der, 0o600)?;
-    write_with_mode(key_path, &bundle.private_key_der, 0o600)?;
-    Ok(())
-}
-
-fn write_with_mode(path: &Path, data: &[u8], _mode: u32) -> Result<(), TlsError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(_mode)
-            .open(path)?;
-        use std::io::Write;
-        f.write_all(data)?;
-        f.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, data)?;
-    }
-    Ok(())
+/// A dummy `ServerName` we always pass to `TlsConnector::connect`. Our
+/// custom verifier ignores the SNI — pinning is on `SHA-256(cert_der)`,
+/// not the hostname.
+pub fn pinned_server_name() -> ServerName<'static> {
+    ServerName::try_from("kmwarp").expect("static literal is a valid DNS name")
 }
 
 /// Build a client-side rustls config: our cert+key for client-auth
-/// presentation, plus a custom server-cert verifier (pin-mode or
-/// pairing-mode).
+/// presentation, plus a custom server-cert verifier (pin or pairing mode).
 pub fn build_client_config(
-    bundle: &CertBundle,
+    cert_der: &[u8],
+    private_key_der: &[u8],
     pinned: Option<[u8; 32]>,
 ) -> Result<Arc<ClientConfig>, TlsError> {
-    let cert_chain = vec![CertificateDer::from(bundle.cert_der.clone())];
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(bundle.private_key_der.clone()));
+    let cert_chain = vec![CertificateDer::from(cert_der.to_vec())];
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der.to_vec()));
 
-    let verifier = Arc::new(PinnedServerVerifier { pinned });
+    let verifier: Arc<dyn ServerCertVerifier> = match pinned {
+        Some(pin) => {
+            let algs = aws_lc_rs::default_provider().signature_verification_algorithms;
+            // `PinnedCertVerifier` impls both Server and Client verifier
+            // traits, and the binary's into_arc_server() / Arc::new wrap
+            // is what the rustls API actually wants here.
+            Arc::new(PinnedCertVerifier::new(pin, algs))
+        }
+        None => Arc::new(PermissiveServerVerifier::new()),
+    };
 
     let cfg = ClientConfig::builder()
         .dangerous()
@@ -136,102 +81,53 @@ pub fn build_client_config(
     Ok(Arc::new(cfg))
 }
 
-/// A dummy `ServerName` we always pass to `TlsConnector::connect`. The
-/// pin verifier ignores the SNI — pinning is on the SHA-256 of the cert
-/// DER, not on the hostname.
-pub fn pinned_server_name() -> ServerName<'static> {
-    // "kmwarp" is the CN we put in self-signed certs; using it for SNI
-    // keeps the handshake clean even though our verifier ignores it.
-    ServerName::try_from("kmwarp").expect("static literal is a valid DNS name")
-}
-
+/// `ServerCertVerifier` that accepts any cert. Used only during the M9
+/// first-launch pairing window.
 #[derive(Debug)]
-struct PinnedServerVerifier {
-    pinned: Option<[u8; 32]>,
+struct PermissiveServerVerifier {
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
 }
 
-impl ServerCertVerifier for PinnedServerVerifier {
+impl PermissiveServerVerifier {
+    fn new() -> Self {
+        Self {
+            algs: aws_lc_rs::default_provider().signature_verification_algorithms,
+        }
+    }
+}
+
+impl ServerCertVerifier for PermissiveServerVerifier {
     fn verify_server_cert(
         &self,
-        end_entity: &CertificateDer<'_>,
+        _end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        let Some(expected) = self.pinned.as_ref() else {
-            warn!("pairing mode: accepting any server cert; pin will be set after handshake");
-            return Ok(ServerCertVerified::assertion());
-        };
-        let actual = sha2_of(end_entity.as_ref());
-        if bool::from(actual.ct_eq(expected)) {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::ApplicationVerificationFailure,
-            ))
-        }
+        warn!("pairing mode: accepting any server cert; pin will be set after handshake");
+        Ok(ServerCertVerified::assertion())
     }
 
-    /// We don't actually verify the chain (the pin is authoritative); but
-    /// we still need the signature shape to be valid. rustls' default
-    /// verifier handles the schemes we care about.
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-        ]
-    }
-}
-
-fn sha2_of(bytes: &[u8]) -> [u8; 32] {
-    use sha2::Digest;
-    sha2::Sha256::digest(bytes).into()
-}
-
-/// Default config-dir paths for the M9 cert / key / pin files. Resolves
-/// via the same logic as `Config::default_config_path` (so the cert and
-/// pin live alongside `config.toml`).
-pub struct M9Paths {
-    pub cert: PathBuf,
-    pub key: PathBuf,
-    pub pin: PathBuf,
-}
-
-impl M9Paths {
-    /// Resolve under the OS-conventional config dir.
-    #[allow(clippy::should_implement_trait)]
-    pub fn default() -> Option<Self> {
-        let dir = kmwarp_core::config::Config::default_config_path()?
-            .parent()?
-            .to_path_buf();
-        Some(Self {
-            cert: dir.join(CERT_FILENAME),
-            key: dir.join(KEY_FILENAME),
-            pin: dir.join(PIN_FILENAME),
-        })
+        self.algs.supported_schemes()
     }
 }
