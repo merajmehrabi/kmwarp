@@ -65,6 +65,63 @@ The CLI also accepts `--help` and `--version`:
 target/release/kmwarp-server --help
 ```
 
+## Install (Windows client)
+
+Register the client as an auto-start Windows service so it survives
+reboot and runs without a logged-in terminal.
+
+1. Build the release binary on the Windows box:
+   ```powershell
+   cargo build --release -p kmwarp-client
+   ```
+2. Open PowerShell **as Administrator** (the SCM rejects unprivileged
+   `create_service` calls).
+3. Install + start:
+   ```powershell
+   .\target\release\kmwarp-client.exe install
+   ```
+4. Verify with `Get-Service kmwarp-client` — should report `Running`.
+   Reboot to confirm AutoStart works.
+5. Pair (one-time): launch interactively once
+   (`.\target\release\kmwarp-client.exe`) to enter the 6-digit SPAKE2
+   code shown on the Mac. The pin file at
+   `%APPDATA%\kmwarp\peer.pin` is shared with the service.
+6. Uninstall:
+   ```powershell
+   .\target\release\kmwarp-client.exe uninstall
+   ```
+
+### Session-0 isolation (the gotcha)
+
+A `LocalSystem` service runs in session 0 and cannot reach the
+user-session desktop with `SendInput`. The service works around this
+by re-spawning itself as `run-as-helper` into the active console
+session via `WTSQueryUserToken` + `CreateProcessAsUserW`. This means:
+
+- **No user logged in → no helper.** If nobody is signed in at the
+  console, the helper spawn fails and the service exits cleanly.
+  Log in and `Start-Service kmwarp-client`.
+- **Active user changes mid-session.** v1 does not handle
+  `WM_WTSSESSION_CHANGE`; if the logged-in user changes (logout +
+  different user), restart the service.
+
+### Signed Windows builds
+
+Production deployment needs an Authenticode signature or Windows
+Defender / corporate AV will flag the service binary. Run the
+codesign pipeline:
+
+```powershell
+$env:KMWARP_PFX = "C:\path\to\codesign.pfx"
+$env:KMWARP_PFX_PASSWORD = "..."
+.\scripts\build-windows.ps1
+```
+
+The script builds release for `x86_64-pc-windows-msvc`, signs with
+SHA256, and RFC-3161-timestamps via the configured service. The
+optional cargo-wix MSI step is commented in the script (needs a
+one-time `cargo wix init`).
+
 ## Signed / notarized release builds
 
 For builds suitable for distribution to other users (Gatekeeper-
