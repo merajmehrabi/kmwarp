@@ -1,7 +1,17 @@
 //! kmwarp-client entry point.
 //!
-//! Reads connect address and peer name from the environment, initializes
-//! `tracing`, and hands off to [`kmwarp_client::app::run_client`].
+//! Subcommands (parsed via `clap`):
+//!
+//! - `run` (default) — foreground connect-and-inject. The user's "just
+//!   start it from a terminal" path.
+//! - `install` — register as an auto-start Windows service. Requires
+//!   Administrator. Windows-only.
+//! - `uninstall` — stop + delete the service. Windows-only.
+//! - `run-as-service` — entry point invoked by the SCM. Not for humans.
+//!   Windows-only.
+//! - `run-as-helper` — entry point spawned by the service into the
+//!   active user session via `CreateProcessAsUserW`. Same semantics as
+//!   `run`; named distinctly so the service path is grep-able.
 //!
 //! Environment:
 //!   * `KMWARP_CONNECT` — server address to connect to (default `127.0.0.1:51423`).
@@ -52,25 +62,74 @@
 //!
 //! No infinite ping-pong: the `EchoGuard` on each side suppresses the
 //! immediate local change-notification triggered by the inbound write.
+//!
+//! M10 install (Windows, elevated PowerShell):
+//!
+//! ```powershell
+//! cargo build --release -p kmwarp-client
+//! .\target\release\kmwarp-client.exe install
+//! # ... reboot or `Start-Service kmwarp-client` ...
+//! .\target\release\kmwarp-client.exe uninstall
+//! ```
 
 use std::env;
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
 use kmwarp_client::app::run_client;
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_CONNECT: &str = "127.0.0.1:51423";
 const DEFAULT_PEER_NAME: &str = "kmwarp-client";
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(Parser, Debug)]
+#[command(name = "kmwarp-client", version, about = "kmwarp Windows client")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run in the foreground (default).
+    Run,
+    /// Register as an auto-start Windows service (requires Administrator).
+    Install,
+    /// Stop and delete the registered Windows service.
+    Uninstall,
+    /// SCM dispatcher entry point. Not for interactive use.
+    RunAsService,
+    /// User-session helper entry point spawned by the service. Same
+    /// semantics as `run`, named distinctly so the service path is
+    /// grep-able in logs.
+    RunAsHelper,
+}
+
+fn main() -> Result<()> {
+    init_tracing();
+
+    let cli = Cli::parse();
+    match cli.command.unwrap_or(Command::Run) {
+        Command::Install => install_subcommand(),
+        Command::Uninstall => uninstall_subcommand(),
+        Command::RunAsService => run_as_service_subcommand(),
+        Command::Run | Command::RunAsHelper => run_foreground(),
+    }
+}
+
+fn init_tracing() {
     // RUST_LOG (if set) wins; otherwise default to `kmwarp=info`. See the
     // server `main.rs` for why we don't layer `.add_directive` on top.
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("kmwarp=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
 
+/// Foreground run — the `run` and `run-as-helper` subcommands route here.
+/// Also handles the `KMWARP_M3_DEMO=1` env-gated demo harness so the M3
+/// invocation continues to work without a dedicated subcommand.
+fn run_foreground() -> Result<()> {
     if env::var("KMWARP_M3_DEMO").as_deref() == Ok("1") {
         return run_m3_demo();
     }
@@ -81,14 +140,58 @@ async fn main() -> Result<()> {
         .with_context(|| format!("parsing KMWARP_CONNECT={connect_str:?}"))?;
     let peer_name = env::var("KMWARP_PEER_NAME").unwrap_or_else(|_| DEFAULT_PEER_NAME.to_string());
 
-    run_client(connect, &peer_name).await
+    // Build a tokio runtime here rather than using #[tokio::main] so the
+    // service / install subcommands stay sync — Windows service dispatch
+    // is fundamentally sync and a tokio attribute on `main` would force
+    // a runtime where one isn't wanted.
+    let rt = tokio::runtime::Runtime::new().context("building tokio runtime")?;
+    rt.block_on(run_client(connect, &peer_name))
 }
 
-/// M3 acceptance harness: drive the cursor in a parametric circle via
-/// `SendInput` for 5 seconds. Per spec §M3 acceptance criterion.
-///
-/// Implementation lives in [`m3_demo`] on Windows; the macOS stub here
-/// keeps `cargo run -p kmwarp-client` from misbehaving on the dev host.
+// ──────────────────────────────────────────────────────────────────────
+// Windows service subcommands
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "windows")]
+fn install_subcommand() -> Result<()> {
+    kmwarp_client::service::windows_service::install_service()
+        .context("installing Windows service")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn install_subcommand() -> Result<()> {
+    anyhow::bail!("`install` is Windows-only; this binary targets a non-Windows OS")
+}
+
+#[cfg(target_os = "windows")]
+fn uninstall_subcommand() -> Result<()> {
+    kmwarp_client::service::windows_service::uninstall_service()
+        .context("uninstalling Windows service")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn uninstall_subcommand() -> Result<()> {
+    anyhow::bail!("`uninstall` is Windows-only; this binary targets a non-Windows OS")
+}
+
+#[cfg(target_os = "windows")]
+fn run_as_service_subcommand() -> Result<()> {
+    kmwarp_client::service::windows_service::run_as_service()
+        .context("running as Windows service")?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_as_service_subcommand() -> Result<()> {
+    anyhow::bail!("`run-as-service` is Windows-only; this binary targets a non-Windows OS")
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// M3 cursor-circle demo (Windows-only; macOS stub)
+// ──────────────────────────────────────────────────────────────────────
+
 #[cfg(target_os = "windows")]
 fn run_m3_demo() -> Result<()> {
     m3_demo::run()
