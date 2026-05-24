@@ -99,10 +99,11 @@ impl ServerPairing {
     /// Consume the session with the peer's element B and derive the
     /// shared key.
     pub fn finish(self, peer_msg: &[u8]) -> Result<SharedKey, PairingError> {
-        let key = self.inner.finish(peer_msg).map_err(|_| PairingError::Spake)?;
-        key.as_slice()
-            .try_into()
-            .map_err(|_| PairingError::Spake)
+        let key = self
+            .inner
+            .finish(peer_msg)
+            .map_err(|_| PairingError::Spake)?;
+        key.as_slice().try_into().map_err(|_| PairingError::Spake)
     }
 }
 
@@ -126,10 +127,11 @@ impl ClientPairing {
     /// Consume the session with the peer's element A and derive the
     /// shared key.
     pub fn finish(self, peer_msg: &[u8]) -> Result<SharedKey, PairingError> {
-        let key = self.inner.finish(peer_msg).map_err(|_| PairingError::Spake)?;
-        key.as_slice()
-            .try_into()
-            .map_err(|_| PairingError::Spake)
+        let key = self
+            .inner
+            .finish(peer_msg)
+            .map_err(|_| PairingError::Spake)?;
+        key.as_slice().try_into().map_err(|_| PairingError::Spake)
     }
 }
 
@@ -178,7 +180,10 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_zero, "200 draws should include at least one leading-zero code");
+        assert!(
+            saw_zero,
+            "200 draws should include at least one leading-zero code"
+        );
     }
 
     #[test]

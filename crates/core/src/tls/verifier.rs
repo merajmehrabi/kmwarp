@@ -164,13 +164,8 @@ mod tests {
         let v = PinnedCertVerifier::new(pin, provider_algs());
 
         let end_entity = CertificateDer::from(bundle.cert_der.clone());
-        let result = v.verify_server_cert(
-            &end_entity,
-            &[],
-            &dummy_server_name(),
-            &[],
-            UnixTime::now(),
-        );
+        let result =
+            v.verify_server_cert(&end_entity, &[], &dummy_server_name(), &[], UnixTime::now());
         assert!(result.is_ok(), "matching pin should verify");
     }
 
@@ -182,13 +177,8 @@ mod tests {
         let v = PinnedCertVerifier::new(pin_of_a, provider_algs());
 
         let end_entity = CertificateDer::from(cert_b.cert_der.clone());
-        let result = v.verify_server_cert(
-            &end_entity,
-            &[],
-            &dummy_server_name(),
-            &[],
-            UnixTime::now(),
-        );
+        let result =
+            v.verify_server_cert(&end_entity, &[], &dummy_server_name(), &[], UnixTime::now());
         assert!(matches!(
             result,
             Err(RustlsError::InvalidCertificate(

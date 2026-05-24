@@ -168,7 +168,10 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let store = PinStore::new(dir.path().join("peer.pin"));
         store.store(&pin_hash_of(b"x")).expect("store");
-        let mode = std::fs::metadata(store.path()).unwrap().permissions().mode();
+        let mode = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600);
     }
 }

@@ -136,9 +136,9 @@ impl FrameWriter {
 
 async fn write_raw_to(w: &mut DynWrite, payload: &[u8]) -> Result<(), ClientError> {
     if payload.len() > MAX_RAW_FRAME {
-        return Err(ClientError::Wire(
-            kmwarp_core::WireError::InvalidPayload("raw frame exceeds 64 KiB cap"),
-        ));
+        return Err(ClientError::Wire(kmwarp_core::WireError::InvalidPayload(
+            "raw frame exceeds 64 KiB cap",
+        )));
     }
     let len = u32::try_from(payload.len()).expect("bounds-checked above");
     w.write_all(&len.to_le_bytes()).await?;

@@ -335,6 +335,17 @@ pub(crate) fn dispatch_one<S: InputSink>(
         Message::ClipboardText { .. } => {
             handle_clipboard_text(msg, guard);
         }
+        // M9 pairing frames should only appear pre-handshake (the
+        // pairing flow consumes them via dedicated reads in
+        // `net::pairing`). Anything that reaches the steady-state
+        // injector is unexpected — log and drop rather than panic.
+        Message::PairSpakeA { .. }
+        | Message::PairSpakeB { .. }
+        | Message::PairCertExchange { .. }
+        | Message::PairAccepted
+        | Message::PairRejected { .. } => {
+            warn!(?msg, "unexpected pairing frame mid-session; ignoring");
+        }
         // `apply_mouse_to_sink` / `apply_key_to_sink` covered these
         // above; the compiler can't tell, so fall through.
         Message::MouseMoveRel { .. } | Message::MouseButton { .. } | Message::MouseWheel { .. } => {
