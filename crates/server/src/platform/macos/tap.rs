@@ -335,7 +335,10 @@ fn translate_flags_changed(event: &CGEvent, held: &Cell<u32>) -> Option<SourceEv
     let bit_idx = match mod_bit(cg_vk) {
         Some(b) => b,
         None => {
-            trace!(?cg_vk, "FlagsChanged: vk is not a tracked modifier; dropping");
+            trace!(
+                ?cg_vk,
+                "FlagsChanged: vk is not a tracked modifier; dropping"
+            );
             return None;
         }
     };
@@ -352,7 +355,11 @@ fn translate_flags_changed(event: &CGEvent, held: &Cell<u32>) -> Option<SourceEv
     let hid = match macos_to_hid(cg_vk) {
         Some(h) => h,
         None => {
-            trace!(?cg_vk, ?state, "FlagsChanged: vk has no HID mapping; dropping");
+            trace!(
+                ?cg_vk,
+                ?state,
+                "FlagsChanged: vk has no HID mapping; dropping"
+            );
             return None;
         }
     };
