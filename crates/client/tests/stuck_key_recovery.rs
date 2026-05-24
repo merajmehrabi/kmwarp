@@ -27,6 +27,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use kmwarp_client::error::ClientError;
 use kmwarp_client::net::{injector_loop_with_source, FrameSource};
+use kmwarp_core::clipboard::EchoGuard;
 use kmwarp_core::hid::usage;
 use kmwarp_core::wire::{key_state_code, Message};
 use kmwarp_core::{InputSink, KeyState, ModMask, MouseButton};
@@ -114,7 +115,8 @@ async fn stuck_key_recovery_drains_held_keys_on_disconnect() {
     // 3. Run with a backstop timeout. The injector should return Err
     //    (Disconnected) almost immediately after consuming the 5 frames,
     //    and the drain runs synchronously before that return.
-    let run = injector_loop_with_source(source, sink, notify, tx_out, active);
+    let echo_guard = Arc::new(Mutex::new(EchoGuard::new()));
+    let run = injector_loop_with_source(source, sink, notify, tx_out, active, echo_guard);
     let result = tokio::time::timeout(Duration::from_secs(3), run)
         .await
         .expect("injector hung past 3s backstop");
@@ -191,7 +193,8 @@ async fn no_drain_when_held_set_is_balanced_before_disconnect() {
     let notify = Arc::new(Notify::new());
     let active = Arc::new(AtomicBool::new(false));
 
-    let run = injector_loop_with_source(source, sink, notify, tx_out, active);
+    let echo_guard = Arc::new(Mutex::new(EchoGuard::new()));
+    let run = injector_loop_with_source(source, sink, notify, tx_out, active, echo_guard);
     let _ = tokio::time::timeout(Duration::from_secs(3), run)
         .await
         .expect("injector hung past 3s backstop");

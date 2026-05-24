@@ -39,6 +39,19 @@
 //! Mac keyboard produces the corresponding characters in Windows Notepad.
 //! Deferred keys (media, Fn-layer, IME / dead keys) are tracked in
 //! IDEAS.md per PLAN.md §M5.
+//!
+//! M8 acceptance check (clipboard sync, both directions):
+//!
+//! Same two `cargo run` invocations as M5. Then:
+//!
+//! 1. On the **Mac**: copy some text in any app (`Cmd+C`).
+//! 2. On the **Windows** box: paste into Notepad (`Ctrl+V`). The text
+//!    should appear, propagation < 500 ms.
+//! 3. On **Windows**: copy different text (`Ctrl+C`).
+//! 4. On the **Mac**: paste (`Cmd+V`). Other text should appear.
+//!
+//! No infinite ping-pong: the `EchoGuard` on each side suppresses the
+//! immediate local change-notification triggered by the inbound write.
 
 use std::env;
 use std::net::SocketAddr;

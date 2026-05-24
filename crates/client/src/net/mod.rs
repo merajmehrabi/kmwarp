@@ -7,4 +7,6 @@ pub mod connection;
 pub mod pump;
 
 pub use connection::{Connection, FrameReader, FrameWriter};
+#[cfg(target_os = "windows")]
+pub use pump::clipboard_out_task;
 pub use pump::{encoder_loop, injector_loop, injector_loop_with_source, FrameSource};

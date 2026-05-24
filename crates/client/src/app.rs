@@ -31,9 +31,10 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kmwarp_core::clipboard::EchoGuard;
 use kmwarp_core::wire::{Message, PROTO_VERSION};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Notify};
@@ -163,14 +164,16 @@ async fn run_one_session(
 
 /// Spawn the session task graph and wait for the first exit.
 ///
-/// Tasks (four base + one Windows-only):
+/// Tasks (four base + up to two Windows-only):
 /// - `encoder_loop` — drains the outbound channel to the socket.
 /// - `heartbeat_producer` — 500 ms ticks of `Heartbeat`.
 /// - `injector_loop` — dispatches inbound frames; toggles `active` on
-///   `TakeControl` / `ReleaseControl`.
+///   `TakeControl` / `ReleaseControl`; reassembles inbound clipboard.
 /// - `deadline_watcher` — 2 s peer-silence detector.
 /// - `cursor_leave_watcher` (Windows only) — 60 Hz `GetCursorPos` poll;
 ///   emits `ReleaseControl` when the cursor crosses the left edge.
+/// - `clipboard_out_task` (Windows only) — drains
+///   `AddClipboardFormatListener` events; chunks + sends to the wire.
 async fn run_session_tasks(
     addr: SocketAddr,
     reader: FrameReader,
@@ -184,6 +187,12 @@ async fn run_session_tasks(
     // exactly one session — a fresh `Arc` per reconnect prevents stale
     // state carrying over.
     let active = Arc::new(AtomicBool::new(false));
+    // M8 echo-guard: shared between the injector (which updates it
+    // after writing an inbound payload) and the clipboard_out_task
+    // (which checks it before forwarding a local change). std::Mutex
+    // because both critical sections are short and don't span an
+    // .await; tokio's async Mutex would just add overhead.
+    let echo_guard = Arc::new(Mutex::new(EchoGuard::new()));
 
     let mut set: JoinSet<TaskExit> = JoinSet::new();
 
@@ -196,21 +205,38 @@ async fn run_session_tasks(
         Arc::clone(&notify),
         tx_out.clone(),
         Arc::clone(&active),
+        Arc::clone(&echo_guard),
     ));
     set.spawn(deadline_watcher(addr, notify));
 
-    // Windows-only: spawn the cursor-leave watcher. On non-Windows hosts
-    // (macOS dev box, Linux CI) the watcher doesn't exist and `active`
-    // is set/read but otherwise ignored — the NoOpSink doesn't care.
+    // Windows-only: spawn the cursor-leave watcher + the clipboard
+    // out-pump. On non-Windows hosts (macOS dev box, Linux CI) neither
+    // task exists; the codec path is still exercised by the injector +
+    // NoOpSink for smoke testing.
     #[cfg(target_os = "windows")]
     {
-        use crate::platform::windows::{cursor_leave_watcher, primary_screen_size};
+        use crate::platform::windows::{cursor_leave_watcher, primary_screen_size, WinClipboard};
         let safe_warp_x = (primary_screen_size().0 / 2).max(1);
         set.spawn(spawn_cursor_watcher(
             tx_out.clone(),
             Arc::clone(&active),
             safe_warp_x,
         ));
+        // Clipboard listener install can fail (RegisterClassW etc).
+        // Treat as non-fatal: log and skip the out-pump; inbound writes
+        // still work without an outbound observer.
+        match WinClipboard::install() {
+            Ok(clipboard) => {
+                set.spawn(spawn_clipboard_out(
+                    clipboard,
+                    Arc::clone(&echo_guard),
+                    tx_out.clone(),
+                ));
+            }
+            Err(e) => {
+                warn!(error = %e, "WinClipboard::install failed; outbound clipboard disabled");
+            }
+        }
     }
 
     // Drop the original sender so the channel closes once every task-held
@@ -247,11 +273,25 @@ async fn spawn_injector(
     notify: Arc<Notify>,
     tx_out: mpsc::Sender<Message>,
     active: Arc<AtomicBool>,
+    echo_guard: Arc<Mutex<EchoGuard>>,
 ) -> TaskExit {
-    match injector_loop(reader, sink, notify, tx_out, active).await {
+    match injector_loop(reader, sink, notify, tx_out, active, echo_guard).await {
         Ok(()) => TaskExit::PeerByeOrClose,
         Err(e) => TaskExit::ReaderFailed(e.to_string()),
     }
+}
+
+/// Windows-only: drive the clipboard out-pump and report exit via
+/// [`TaskExit`].
+#[cfg(target_os = "windows")]
+async fn spawn_clipboard_out(
+    clipboard: crate::platform::windows::WinClipboard,
+    echo_guard: Arc<Mutex<EchoGuard>>,
+    tx_out: mpsc::Sender<Message>,
+) -> TaskExit {
+    use crate::net::clipboard_out_task;
+    clipboard_out_task(clipboard, echo_guard, tx_out).await;
+    TaskExit::ClipboardOutExited
 }
 
 /// Windows-only: drive the cursor-leave watcher and convert its
@@ -281,6 +321,10 @@ enum TaskExit {
     /// outbound channel closes mid-session).
     #[cfg(target_os = "windows")]
     CursorWatcherExited,
+    /// Windows-only: clipboard out-pump exited (listener channel
+    /// closed or encoder torn down).
+    #[cfg(target_os = "windows")]
+    ClipboardOutExited,
     JoinError,
 }
 
@@ -301,6 +345,10 @@ fn log_exit(addr: SocketAddr, exit: TaskExit) {
         #[cfg(target_os = "windows")]
         TaskExit::CursorWatcherExited => {
             debug!(addr = %addr, "cursor-leave watcher exited; tearing down")
+        }
+        #[cfg(target_os = "windows")]
+        TaskExit::ClipboardOutExited => {
+            debug!(addr = %addr, "clipboard out-pump exited; tearing down")
         }
         TaskExit::JoinError => warn!(addr = %addr, "task join error"),
     }

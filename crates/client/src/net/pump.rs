@@ -27,9 +27,10 @@
 //! dictionary values.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use kmwarp_core::clipboard::{EchoGuard, Reassembler};
 use kmwarp_core::stuck_keys::HeldKeys;
 use kmwarp_core::wire::{apply_key_to_sink, apply_mouse_to_sink, key_state_code, Message};
 use kmwarp_core::{InputSink, KeyState, ModMask};
@@ -68,6 +69,70 @@ pub async fn encoder_loop(
     Ok(())
 }
 
+/// M8 outbound clipboard pump. Drains [`WinClipboard::next_change`]
+/// (Windows-only — the entire task is cfg-gated at the spawn site),
+/// chunks each completed payload via `Chunker::split`, and `try_send`s
+/// the resulting wire frames into the encoder.
+///
+/// Echo-suppression: every local change is hashed against the
+/// `EchoGuard`'s most-recent remote-write hash; matches are dropped to
+/// prevent the inbound write → local-change → outbound send → peer
+/// receives own write → infinite-loop ping-pong.
+///
+/// Exits when `WinClipboard::next_change` returns `None` (sender slot
+/// replaced) or `tx_out` is closed (encoder torn down).
+#[cfg(target_os = "windows")]
+pub async fn clipboard_out_task(
+    mut clipboard: crate::platform::windows::WinClipboard,
+    echo_guard: Arc<Mutex<EchoGuard>>,
+    tx_out: mpsc::Sender<Message>,
+) {
+    use kmwarp_core::clipboard::Chunker;
+    use kmwarp_core::ClipboardEvent;
+
+    debug!("clipboard_out_task entered");
+    while let Some(ClipboardEvent::TextChanged(text)) = clipboard.next_change().await {
+        // Echo check inside a short critical section. We hold the guard
+        // lock only across the hash compute + compare; no await inside.
+        let is_echo = match echo_guard.lock() {
+            Ok(g) => g.is_echo_of_remote(&text),
+            Err(_) => false, // poisoned — better to forward than to silently lose
+        };
+        if is_echo {
+            trace!(
+                len = text.len(),
+                "suppressing local change (echo of remote write)"
+            );
+            continue;
+        }
+
+        let chunks = Chunker::split(&text);
+        let total = chunks.len();
+        for (i, msg) in chunks.into_iter().enumerate() {
+            match tx_out.try_send(msg) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        i,
+                        total, "outbound full; dropping clipboard chunk and aborting payload"
+                    );
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    debug!("encoder closed; clipboard_out_task exiting");
+                    return;
+                }
+            }
+        }
+        trace!(
+            len = text.len(),
+            chunks = total,
+            "forwarded local clipboard change"
+        );
+    }
+    debug!("clipboard_out_task: listener channel closed; exiting");
+}
+
 /// RAII guard around the injector's `(HeldKeys, sink)` pair. Drains every
 /// still-held key into a local `KeyEvent { Up }` on drop, which is the
 /// M7 stuck-key recovery invariant.
@@ -79,13 +144,23 @@ pub async fn encoder_loop(
 /// hook.
 pub(crate) struct InjectorGuard<S: InputSink> {
     held: HeldKeys,
+    /// Per-session clipboard chunk reassembler (M8). Stays at this scope
+    /// so a mid-stream reconnect resets the in-progress buffer rather
+    /// than carrying stale bytes into the next session.
+    reassembler: Reassembler,
+    /// Shared with the Windows-only `clipboard_out_task`. Updated after
+    /// every inbound write so the watcher knows to suppress the local
+    /// change-notification we're about to receive.
+    echo_guard: Arc<Mutex<EchoGuard>>,
     sink: S,
 }
 
 impl<S: InputSink> InjectorGuard<S> {
-    pub(crate) fn new(sink: S) -> Self {
+    pub(crate) fn new(sink: S, echo_guard: Arc<Mutex<EchoGuard>>) -> Self {
         Self {
             held: HeldKeys::new(),
+            reassembler: Reassembler::new(),
+            echo_guard,
             sink,
         }
     }
@@ -99,17 +174,33 @@ impl<S: InputSink> InjectorGuard<S> {
     pub(crate) fn sink_mut(&mut self) -> &mut S {
         &mut self.sink
     }
+
+    /// Mutable access to the per-session reassembler.
+    pub(crate) fn reassembler_mut(&mut self) -> &mut Reassembler {
+        &mut self.reassembler
+    }
+
+    /// Shared handle to the echo guard, for both the inbound-write
+    /// update and the outbound-task suppression check.
+    pub(crate) fn echo_guard(&self) -> &Arc<Mutex<EchoGuard>> {
+        &self.echo_guard
+    }
 }
 
 impl<S: InputSink> Drop for InjectorGuard<S> {
     fn drop(&mut self) {
-        if self.held.is_empty() {
-            return;
+        // M7 stuck-key drain.
+        if !self.held.is_empty() {
+            let count = self.held.len();
+            warn!(count, "draining held keys locally on injector exit (M7)");
+            for hid in self.held.drain() {
+                self.sink.inject_key(hid, KeyState::Up, ModMask::default());
+            }
         }
-        let count = self.held.len();
-        warn!(count, "draining held keys locally on injector exit (M7)");
-        for hid in self.held.drain() {
-            self.sink.inject_key(hid, KeyState::Up, ModMask::default());
+        // M8 clipboard echo-guard reset: a post-disconnect local copy
+        // should NOT be suppressed against a stale remembered hash.
+        if let Ok(mut g) = self.echo_guard.lock() {
+            g.clear();
         }
     }
 }
@@ -150,8 +241,9 @@ pub async fn injector_loop<S: InputSink + Send>(
     notify: Arc<Notify>,
     tx_out: mpsc::Sender<Message>,
     active: Arc<AtomicBool>,
+    echo_guard: Arc<Mutex<EchoGuard>>,
 ) -> Result<(), ClientError> {
-    injector_loop_with_source(reader, sink, notify, tx_out, active).await
+    injector_loop_with_source(reader, sink, notify, tx_out, active, echo_guard).await
 }
 
 /// Generic injector entry-point used by both production (with a
@@ -166,12 +258,13 @@ pub async fn injector_loop_with_source<F, S>(
     notify: Arc<Notify>,
     tx_out: mpsc::Sender<Message>,
     active: Arc<AtomicBool>,
+    echo_guard: Arc<Mutex<EchoGuard>>,
 ) -> Result<(), ClientError>
 where
     F: FrameSource,
     S: InputSink + Send,
 {
-    let mut guard = InjectorGuard::new(sink);
+    let mut guard = InjectorGuard::new(sink, echo_guard);
     loop {
         let msg = source.next_frame().await?;
         notify.notify_one();
@@ -240,7 +333,7 @@ pub(crate) fn dispatch_one<S: InputSink>(
             );
         }
         Message::ClipboardText { .. } => {
-            trace!(?msg, "received frame; M8 will handle");
+            handle_clipboard_text(msg, guard);
         }
         // `apply_mouse_to_sink` / `apply_key_to_sink` covered these
         // above; the compiler can't tell, so fall through.
@@ -248,5 +341,52 @@ pub(crate) fn dispatch_one<S: InputSink>(
             unreachable!("handled by apply_mouse_to_sink")
         }
         Message::KeyEvent { .. } => unreachable!("handled by apply_key_to_sink"),
+    }
+}
+
+/// M8 inbound clipboard path. Feeds the frame to the per-session
+/// reassembler; on a completed payload writes the local clipboard and
+/// records the SHA-256 in the shared `EchoGuard` so the
+/// `clipboard_out_task` knows to suppress the change-notification we
+/// just caused.
+///
+/// On non-Windows hosts the clipboard write is a `trace!` no-op so the
+/// macOS dev host still drives the codec path end-to-end without
+/// touching the system clipboard.
+pub(crate) fn handle_clipboard_text<S: InputSink>(msg: &Message, guard: &mut InjectorGuard<S>) {
+    let text = match guard.reassembler_mut().ingest(msg) {
+        Ok(Some(t)) => t,
+        Ok(None) => return, // mid-stream chunk; nothing to write yet
+        Err(e) => {
+            warn!(error = %e, "clipboard reassembly failed; dropping payload");
+            return;
+        }
+    };
+
+    let len = text.len();
+    trace!(len, "completed inbound clipboard payload");
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(e) = crate::platform::windows::write_clipboard_text(&text) {
+            warn!(error = %e, len, "failed to write inbound clipboard");
+            return;
+        }
+        // Remember the hash so the watcher suppresses the upcoming
+        // local change event.
+        if let Ok(mut g) = guard.echo_guard().lock() {
+            g.remember_remote_write(&text);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // No system-clipboard backend on this host. Still update the
+        // echo guard so consumers (tests, future cross-platform sinks)
+        // see a consistent state machine.
+        let _ = len; // suppress unused warning on non-Windows
+        if let Ok(mut g) = guard.echo_guard().lock() {
+            g.remember_remote_write(&text);
+        }
+        trace!("non-Windows host; clipboard write is a no-op");
     }
 }
