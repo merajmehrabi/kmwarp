@@ -5,5 +5,6 @@
 //! inside the library so future integration tests and (eventually) the M10
 //! LaunchAgent helper can link against it without rebuilding a binary.
 
+pub mod app;
 pub mod error;
 pub mod net;
