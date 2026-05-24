@@ -12,7 +12,7 @@
 //! converting its native units to/from this convention; the helpers here
 //! are byte-pure (i.e. they do not do unit conversion).
 
-use crate::platform::{InputSink, KeyState, MouseButton, SourceEvent};
+use crate::platform::{InputSink, KeyState, ModMask, MouseButton, SourceEvent};
 use crate::wire::{key_state_code, mouse_button_code, Message};
 
 /// Wire byte → [`MouseButton`]. Returns `None` on unrecognized values so
@@ -84,6 +84,37 @@ pub fn source_event_to_message(ev: SourceEvent) -> Option<Message> {
     }
 }
 
+/// Apply a `KeyEvent` wire `Message` to an [`InputSink`].
+///
+/// Returns `true` iff the message was a `KeyEvent` and dispatch was
+/// attempted. Caller uses the `false` return to fall through to non-key
+/// dispatch (mouse, clipboard, edge).
+///
+/// Wire-byte → enum conversions are tolerant: an unknown `state` byte
+/// logs a `warn!` and drops the event rather than panicking. The
+/// `modifiers` byte is passed through verbatim — every bit pattern is a
+/// valid [`ModMask`] (its `u8` field is `pub`).
+pub fn apply_key_to_sink<S: InputSink>(msg: &Message, sink: &mut S) -> bool {
+    match msg {
+        Message::KeyEvent {
+            hid_usage,
+            state,
+            modifiers,
+        } => {
+            match byte_to_key_state(*state) {
+                Some(st) => sink.inject_key(*hid_usage, st, ModMask(*modifiers)),
+                None => tracing::warn!(
+                    hid_usage,
+                    state = *state,
+                    "dropping KeyEvent with unknown state byte"
+                ),
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Apply a mouse-shaped wire `Message` to an [`InputSink`].
 ///
 /// Returns `true` iff the message was a mouse variant and dispatch was
@@ -131,6 +162,7 @@ mod tests {
         rel: Vec<(i32, i32)>,
         buttons: Vec<(MouseButton, KeyState)>,
         wheels: Vec<(i16, i16)>,
+        keys: Vec<(u16, KeyState, ModMask)>,
     }
 
     impl InputSink for RecorderSink {
@@ -143,7 +175,9 @@ mod tests {
         fn inject_mouse_wheel(&mut self, dx: i16, dy: i16) {
             self.wheels.push((dx, dy));
         }
-        fn inject_key(&mut self, _h: u16, _s: KeyState, _m: ModMask) {}
+        fn inject_key(&mut self, h: u16, s: KeyState, m: ModMask) {
+            self.keys.push((h, s, m));
+        }
         fn warp_cursor_abs(&mut self, _x: i32, _y: i32) {}
         fn hide_cursor(&mut self) {}
         fn show_cursor(&mut self) {}
@@ -227,6 +261,75 @@ mod tests {
         assert_eq!(sink.rel, vec![(4, -2)]);
         assert_eq!(sink.buttons, vec![(MouseButton::Right, KeyState::Down)]);
         assert_eq!(sink.wheels, vec![(0, 3)]);
+    }
+
+    #[test]
+    fn apply_key_dispatches_keyevent() {
+        let mut sink = RecorderSink::default();
+
+        // hid=0x04 (A), down, with Shift+Ctrl modifiers
+        let mods_byte = ModMask::SHIFT.0 | ModMask::CTRL.0;
+        assert!(apply_key_to_sink(
+            &Message::KeyEvent {
+                hid_usage: 0x04,
+                state: key_state_code::DOWN,
+                modifiers: mods_byte,
+            },
+            &mut sink
+        ));
+        // Up event without modifiers.
+        assert!(apply_key_to_sink(
+            &Message::KeyEvent {
+                hid_usage: 0x04,
+                state: key_state_code::UP,
+                modifiers: 0,
+            },
+            &mut sink
+        ));
+        // Non-key → false, sink untouched.
+        assert!(!apply_key_to_sink(
+            &Message::Heartbeat { seq: 1 },
+            &mut sink
+        ));
+
+        assert_eq!(
+            sink.keys,
+            vec![
+                (0x04, KeyState::Down, ModMask(mods_byte)),
+                (0x04, KeyState::Up, ModMask(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_key_drops_unknown_state_byte() {
+        let mut sink = RecorderSink::default();
+        assert!(apply_key_to_sink(
+            &Message::KeyEvent {
+                hid_usage: 0x04,
+                state: 99, // not Up or Down
+                modifiers: 0,
+            },
+            &mut sink
+        ));
+        assert!(sink.keys.is_empty());
+    }
+
+    #[test]
+    fn source_event_translates_key_variant() {
+        let mods = ModMask::SHIFT;
+        assert_eq!(
+            source_event_to_message(SourceEvent::Key {
+                hid_usage: 0x16, // 'S'
+                state: KeyState::Down,
+                mods,
+            }),
+            Some(Message::KeyEvent {
+                hid_usage: 0x16,
+                state: key_state_code::DOWN,
+                modifiers: mods.0,
+            })
+        );
     }
 
     #[test]
