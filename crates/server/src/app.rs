@@ -1,6 +1,6 @@
 //! Top-level server runtime.
 //!
-//! ## Per-peer task topology (M4)
+//! ## Per-peer task topology (M6)
 //!
 //! After the handshake, the per-peer session spins up the following tasks,
 //! all managed by a single [`JoinSet`]. First exit aborts the rest so logs
@@ -10,26 +10,46 @@
 //!  ┌───────────────────────────┐   tx_out (mpsc 256, bounded)
 //!  │ heartbeat_producer        │ ─────────────┐
 //!  └───────────────────────────┘              │
-//!  ┌───────────────────────────┐              ▼
-//!  │ mouse_pump (cfg macos)    │ ─────► ┌─────────────────┐
-//!  │  MacInputSource → Message │        │ encoder_loop    │ ─────► socket
-//!  └───────────────────────────┘        │ (owns FrameWri.) │
-//!  ┌───────────────────────────┐        └─────────────────┘
-//!  │ latency_prober (cfg feat) │ ────────────┘
+//!  ┌───────────────────────────┐              │
+//!  │ source_forwarder (macos)  │              │
+//!  │  MacInputSource           │              │
+//!  └─────────────┬─────────────┘              │
+//!                │ brain_tx (mpsc 256)        │
+//!                ▼                            ▼
+//!  ┌───────────────────────────┐    ┌─────────────────┐
+//!  │ edge_brain (macos)        │ ─► │ encoder_loop    │ ─► socket
+//!  │  StateMachine + sink      │    │ (owns FrameWri.) │
+//!  └───────────────────────────┘    └─────────────────┘
+//!  ┌───────────────────────────┐              ▲
+//!  │ latency_prober (cfg feat) │ ─────────────┘
 //!  └───────────────────────────┘
 //!
-//!  socket ─────► ┌─────────────────────┐
-//!                │ reader_task         │ ─ notify (Notify) ─► deadline_watcher
-//!                │  decode + dispatch  │
-//!                │  EchoPing → EchoPong│ ── tx_out (cloned) ──┐
-//!                │  EchoPong → RTT     │                       │
-//!                └─────────────────────┘                       ▼
-//!                                                       encoder_loop
+//!  socket ─► ┌─────────────────────────┐
+//!            │ reader_task             │ ─ notify ─► deadline_watcher
+//!            │  decode + dispatch      │
+//!            │  EchoPing → EchoPong    │ ── tx_out (cloned) ──┐
+//!            │  EchoPong → RTT         │                       │
+//!            │  ReleaseControl → brain │ ── brain_tx (cloned) ─┘
+//!            └─────────────────────────┘
 //! ```
 //!
 //! The bounded `mpsc::channel(256)` is the natural backpressure point per
 //! PLAN.md §Async channel topology. Producers `try_send` and warn-and-drop
 //! on full; the encoder's socket write is the throttle.
+//!
+//! ## M6 acceptance test (manual, real hardware)
+//!
+//! 1. Start `kmwarp-server` on the Mac and `kmwarp-client` on the Windows
+//!    PC; both processes have the relevant TCC / Windows permissions.
+//! 2. Move the Mac cursor to the right edge of the screen — the Mac
+//!    cursor disappears (CGDisplayHideCursor + warp 5 px back), and the
+//!    Windows cursor begins moving in response to physical mouse motion.
+//! 3. From Windows, move the cursor to the left edge — control returns
+//!    to the Mac (the client sends `ReleaseControl { exit_y }`); the Mac
+//!    cursor reappears 5 px in from the right edge at the reported `y`.
+//! 4. Hold Shift across a crossing — Shift release is synthesized on the
+//!    Windows side as part of the `on_release_control` drain; nothing
+//!    sticks.
 //!
 //! ## CGEventTap ownership
 //!
@@ -63,8 +83,24 @@ use tokio::task::JoinSet;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tracing::{debug, error, info, trace, warn};
 
+#[cfg(target_os = "macos")]
+use std::sync::atomic::AtomicBool;
+
 use crate::error::ServerError;
 use crate::net::{encoder_loop, Connection, FrameReader};
+
+/// Edge-state-machine input. Fed by the source forwarder (`Source`
+/// variant) and by `reader_task` (`WireMessage` variant — currently
+/// only `Message::ReleaseControl` is acted on, per `StateMachine::
+/// on_wire_message`). Single consumer: `edge_brain`. macOS-only
+/// because the SM is currently wired exclusively to the macOS
+/// source/sink pair.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+enum BrainInput {
+    Source(kmwarp_core::SourceEvent),
+    WireMessage(Message),
+}
 
 /// Heartbeat cadence; spec §M1 mandates 500 ms.
 const HEARTBEAT_PERIOD: Duration = Duration::from_millis(500);
@@ -77,9 +113,16 @@ const SILENCE_DEADLINE: Duration = Duration::from_secs(2);
 /// `warn!` if this fills (a flatlined socket).
 const OUTBOUND_CHANNEL_BOUND: usize = 256;
 
-/// Placeholder server-screen size returned in `HelloAck`. The real value
-/// comes from `core-graphics` in M2 and from `Config` in M6.
-const PLACEHOLDER_SCREEN_PX: (u16, u16) = (1920, 1080);
+/// Fallback server-screen size returned in `HelloAck` when CG queries
+/// aren't available (non-macOS build). macOS reads the real values from
+/// `CGDisplay::main()` inside `query_screen_px`.
+#[cfg(not(target_os = "macos"))]
+const FALLBACK_SCREEN_PX: (u16, u16) = (1920, 1080);
+
+/// Brain channel bound. Same shape as the outbound channel — bounded
+/// `try_send`, warn-and-drop on overflow.
+#[cfg(target_os = "macos")]
+const BRAIN_CHANNEL_BOUND: usize = 256;
 
 /// Mouse pump → outbound coalescing threshold. When the bounded outbound
 /// channel is full, a `MouseMoveRel` `try_send` failure triggers an
@@ -162,15 +205,16 @@ async fn handle_peer(
         }
     }
 
+    let screen_px = query_screen_px();
     conn.write_frame(&Message::HelloAck {
         accepted: true,
-        server_screen_px: PLACEHOLDER_SCREEN_PX,
+        server_screen_px: screen_px,
     })
     .await?;
     debug!(
         peer = %remote,
         "sent HelloAck (server={}, screen={:?})",
-        server_peer_name, PLACEHOLDER_SCREEN_PX
+        server_peer_name, screen_px
     );
 
     let (reader, writer) = conn.into_split();
@@ -190,13 +234,23 @@ async fn handle_peer(
     // Heartbeat producer: pushes Heartbeat into tx_out every 500 ms.
     set.spawn(heartbeat_producer(remote, tx_out.clone()));
 
+    // Mouse + edge brain (macOS only). Installs the tap, takes the
+    // swallow handle, spawns source-forwarder + edge-brain tasks, and
+    // returns a `brain_tx` clone so the reader can dispatch
+    // `Message::ReleaseControl` into the SM.
+    #[cfg(target_os = "macos")]
+    let brain_tx = spawn_input_brain(&mut set, remote, tx_out.clone(), screen_px.0).await;
+
     // Reader: decode + dispatch. Pulses notify on every successful read,
-    // routes EchoPing → EchoPong, optionally records EchoPong RTT.
+    // routes EchoPing → EchoPong, ReleaseControl → brain, optionally
+    // records EchoPong RTT.
     set.spawn(reader_task(
         remote,
         reader,
         Arc::clone(&notify),
         tx_out.clone(),
+        #[cfg(target_os = "macos")]
+        brain_tx.clone(),
         Arc::clone(&start),
         #[cfg(feature = "latency-probe")]
         Arc::clone(&latency_state),
@@ -204,10 +258,6 @@ async fn handle_peer(
 
     // Deadline watcher: 2 s silence budget.
     set.spawn(deadline_watcher(remote, notify));
-
-    // Mouse pump (cfg macOS only) — installs CGEventTap and forwards.
-    #[cfg(target_os = "macos")]
-    spawn_mouse_pump(&mut set, remote, tx_out.clone()).await;
 
     // Latency probe sender — only with feature, runs alongside.
     #[cfg(feature = "latency-probe")]
@@ -221,6 +271,8 @@ async fn handle_peer(
     // Drop the original sender so the channel can close when all task-held
     // clones are dropped (graceful drain on shutdown).
     drop(tx_out);
+    #[cfg(target_os = "macos")]
+    drop(brain_tx);
 
     run_until_first_exit(remote, set).await;
     info!(peer = %remote, "peer session ended");
@@ -252,7 +304,13 @@ enum TaskExit {
     HeartbeatFailed(String),
     ReaderFailed(String),
     DeadlineExpired,
-    MousePumpFailed(String),
+    /// Source forwarder (macOS) exited — either the tap channel closed
+    /// (run-loop exit) or the brain channel closed (brain went away).
+    #[cfg(target_os = "macos")]
+    SourceForwarderFailed(String),
+    /// Edge brain exited — typically because the brain channel closed.
+    #[cfg(target_os = "macos")]
+    EdgeBrainFailed(String),
     #[cfg(feature = "latency-probe")]
     LatencyProberFailed(String),
     JoinError,
@@ -276,8 +334,13 @@ fn log_exit(remote: SocketAddr, exit: TaskExit) {
             // Already logged inside the watcher.
             debug!(peer = %remote, "deadline watcher fired");
         }
-        TaskExit::MousePumpFailed(reason) => {
-            warn!(peer = %remote, reason, "mouse pump exited; tearing down")
+        #[cfg(target_os = "macos")]
+        TaskExit::SourceForwarderFailed(reason) => {
+            warn!(peer = %remote, reason, "source forwarder exited; tearing down")
+        }
+        #[cfg(target_os = "macos")]
+        TaskExit::EdgeBrainFailed(reason) => {
+            warn!(peer = %remote, reason, "edge brain exited; tearing down")
         }
         #[cfg(feature = "latency-probe")]
         TaskExit::LatencyProberFailed(reason) => {
@@ -331,13 +394,14 @@ async fn heartbeat_producer(remote: SocketAddr, tx: mpsc::Sender<Message>) -> Ta
 }
 
 /// Continuously decode frames, pulse the deadline notifier, route
-/// `EchoPing` → `EchoPong`, and (with `latency-probe`) feed `EchoPong`
-/// RTTs into the histogram.
+/// `EchoPing` → `EchoPong`, `ReleaseControl` → brain (macOS), and
+/// (with `latency-probe`) feed `EchoPong` RTTs into the histogram.
 async fn reader_task(
     remote: SocketAddr,
     mut reader: FrameReader,
     notify: Arc<Notify>,
     tx_out: mpsc::Sender<Message>,
+    #[cfg(target_os = "macos")] brain_tx: Option<mpsc::Sender<BrainInput>>,
     start: Arc<Instant>,
     #[cfg(feature = "latency-probe")] latency: Arc<LatencyState>,
 ) -> TaskExit {
@@ -367,10 +431,31 @@ async fn reader_task(
                         info!(peer = %remote, reason_code, "peer sent Bye");
                         return TaskExit::ReaderFailed("peer Bye".into());
                     }
-                    // Heartbeat / Mouse / Key / Clipboard / TakeControl /
-                    // ReleaseControl from the client: deadline reset is the
-                    // only handling needed in M4. M6 reacts to ReleaseControl;
-                    // M8 to ClipboardText; etc.
+                    #[cfg(target_os = "macos")]
+                    ref m @ Message::ReleaseControl { exit_y } => {
+                        if let Some(ref bt) = brain_tx {
+                            // try_send because reader is on the deadline-
+                            // notifier hot path; a brief brain stall must
+                            // not also stall the deadline pulses.
+                            if let Err(e) = bt.try_send(BrainInput::WireMessage(m.clone())) {
+                                warn!(
+                                    peer = %remote,
+                                    error = ?e,
+                                    exit_y,
+                                    "failed to enqueue ReleaseControl into brain"
+                                );
+                            }
+                        } else {
+                            debug!(
+                                peer = %remote,
+                                exit_y,
+                                "ReleaseControl received but no brain (tap install failed?)"
+                            );
+                        }
+                    }
+                    // Heartbeat / Mouse / Key / Clipboard / TakeControl
+                    // from the client: deadline reset is the only handling
+                    // needed today. M8 will react to ClipboardText.
                     _ => {}
                 }
                 // start is read on the latency-probe path; mark it unused
@@ -396,57 +481,104 @@ async fn deadline_watcher(remote: SocketAddr, notify: Arc<Notify>) -> TaskExit {
 }
 
 // ---------------------------------------------------------------------------
-// macOS mouse pump
+// Screen size query
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
-async fn spawn_mouse_pump(
+fn query_screen_px() -> (u16, u16) {
+    use core_graphics::display::CGDisplay;
+    let main = CGDisplay::main();
+    // `pixels_wide` / `pixels_high` return `u64`; the wire field is u16
+    // (and HelloAck uses u16). Saturate at u16::MAX — anyone running
+    // a >65535-px wide display is outside v1's tested envelope.
+    let w = main.pixels_wide().min(u64::from(u16::MAX)) as u16;
+    let h = main.pixels_high().min(u64::from(u16::MAX)) as u16;
+    (w, h)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn query_screen_px() -> (u16, u16) {
+    FALLBACK_SCREEN_PX
+}
+
+// ---------------------------------------------------------------------------
+// macOS source + edge brain
+// ---------------------------------------------------------------------------
+
+/// Install the macOS tap, spawn the source-forwarder + edge-brain
+/// tasks, and return the `brain_tx` so the reader can dispatch
+/// `Message::ReleaseControl` into the same brain.
+///
+/// Returns `None` when the tap install fails — in that case the server
+/// still runs heartbeats + handshake (preserving M1/M4 fallback
+/// behavior), but no input is forwarded.
+#[cfg(target_os = "macos")]
+async fn spawn_input_brain(
     set: &mut JoinSet<TaskExit>,
     remote: SocketAddr,
     tx_out: mpsc::Sender<Message>,
-) {
+    screen_w_px: u16,
+) -> Option<mpsc::Sender<BrainInput>> {
     use crate::platform::macos::MacInputSource;
 
     // `install` does brief blocking work (std mpsc handshake with the
     // CFRunLoop thread); spawn_blocking keeps the tokio worker free.
     let install_result = tokio::task::spawn_blocking(MacInputSource::install).await;
-    match install_result {
+    let source = match install_result {
         Ok(Ok(source)) => {
-            info!(peer = %remote, "CGEventTap installed for mouse forwarding");
-            set.spawn(mouse_pump_task(remote, source, tx_out));
+            info!(peer = %remote, "CGEventTap installed; edge brain online");
+            source
         }
         Ok(Err(e)) => {
             warn!(
                 peer = %remote,
                 error = %e,
-                "failed to install CGEventTap; continuing with heartbeats only"
+                "failed to install CGEventTap; continuing with heartbeats only \
+                 (no input forwarding, no edge state machine)"
             );
+            return None;
         }
         Err(e) => {
             error!(peer = %remote, error = %e, "spawn_blocking for tap install panicked");
+            return None;
         }
-    }
+    };
+
+    let swallow = source.swallow_handle();
+    let (brain_tx, brain_rx) = mpsc::channel::<BrainInput>(BRAIN_CHANNEL_BOUND);
+
+    set.spawn(source_forwarder_task(remote, source, brain_tx.clone()));
+    set.spawn(edge_brain_task(
+        remote,
+        brain_rx,
+        swallow,
+        tx_out,
+        screen_w_px,
+    ));
+
+    Some(brain_tx)
 }
 
+/// Drain the `MacInputSource` and shovel every `SourceEvent` into the
+/// brain channel. Use `try_send` + warn-and-drop on brain backlog;
+/// blocking the source consumer would push back-pressure into the
+/// CFRunLoop callback's unbounded mpsc, which would just grow
+/// unbounded.
 #[cfg(target_os = "macos")]
-async fn mouse_pump_task(
+async fn source_forwarder_task(
     remote: SocketAddr,
     mut source: crate::platform::macos::MacInputSource,
-    tx_out: mpsc::Sender<Message>,
+    brain_tx: mpsc::Sender<BrainInput>,
 ) -> TaskExit {
     use kmwarp_core::platform::InputSource;
-    use kmwarp_core::wire::source_event_to_message;
 
     let mut drops: u64 = 0;
     loop {
         let ev = match source.next_event().await {
             Some(e) => e,
-            None => return TaskExit::MousePumpFailed("MacInputSource channel closed".into()),
+            None => return TaskExit::SourceForwarderFailed("MacInputSource channel closed".into()),
         };
-        let Some(msg) = source_event_to_message(ev) else {
-            continue;
-        };
-        match tx_out.try_send(msg) {
+        match brain_tx.try_send(BrainInput::Source(ev)) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(dropped)) => {
                 drops = drops.saturating_add(1);
@@ -455,13 +587,116 @@ async fn mouse_pump_task(
                         peer = %remote,
                         ?dropped,
                         drops,
-                        "outbound full; dropping mouse frame"
+                        "brain channel full; dropping SourceEvent"
                     );
                 }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                return TaskExit::MousePumpFailed("outbound channel closed".into())
+                return TaskExit::SourceForwarderFailed("brain channel closed".into())
             }
+        }
+    }
+}
+
+/// Edge-state-machine driver. Owns the SM + `MacInputSink` (cursor
+/// warp/hide). On every `BrainInput`, asks the SM for its action list
+/// and runs each action through `execute_action`.
+///
+/// `screen_w_px` is the *local* (Mac) screen width — the SM detects
+/// right-edge crossings at `x >= local_screen_w`. Local height is
+/// stored only for the SM's `last_cursor` default and isn't used for
+/// any decisions today; we query it once for completeness.
+#[cfg(target_os = "macos")]
+async fn edge_brain_task(
+    remote: SocketAddr,
+    mut brain_rx: mpsc::Receiver<BrainInput>,
+    swallow: std::sync::Arc<AtomicBool>,
+    tx_out: mpsc::Sender<Message>,
+    screen_w_px: u16,
+) -> TaskExit {
+    use kmwarp_core::edge::{EdgeConfig, StateMachine};
+
+    let (w, h) = query_screen_px();
+    debug_assert_eq!(
+        w, screen_w_px,
+        "screen-w mismatch between HelloAck and brain"
+    );
+    let cfg = EdgeConfig {
+        local_screen_w: u32::from(w),
+        local_screen_h: u32::from(h),
+        ..EdgeConfig::default()
+    };
+    let mut sm = StateMachine::new(cfg);
+    let mut sink = crate::platform::macos::inject::MacInputSink::new();
+
+    let epoch = Instant::now();
+    debug!(peer = %remote, screen_w_px, "edge_brain online (LocalActive)");
+
+    while let Some(input) = brain_rx.recv().await {
+        let now_ms = epoch.elapsed().as_millis() as u64;
+        let actions = match input {
+            BrainInput::Source(ev) => sm.on_local_event(ev, now_ms),
+            BrainInput::WireMessage(msg) => {
+                if matches!(msg, Message::ReleaseControl { .. }) {
+                    debug!(peer = %remote, ?msg, "brain: wire message");
+                }
+                sm.on_wire_message(&msg, now_ms)
+            }
+        };
+        for action in actions {
+            execute_action(remote, action, &mut sink, &tx_out, &swallow);
+        }
+    }
+    TaskExit::EdgeBrainFailed("brain input channel closed".into())
+}
+
+/// Synchronous action executor. The wire-bound actions go through
+/// `tx_out.try_send` (warn-and-drop on full, same backpressure rule as
+/// the rest of the M4 pump). Cursor-control actions are direct CG calls
+/// on the sink. Swallow flips a single atomic.
+#[cfg(target_os = "macos")]
+fn execute_action(
+    remote: SocketAddr,
+    action: kmwarp_core::edge::Action,
+    sink: &mut crate::platform::macos::inject::MacInputSink,
+    tx_out: &mpsc::Sender<Message>,
+    swallow: &std::sync::Arc<AtomicBool>,
+) {
+    use kmwarp_core::edge::Action;
+    use kmwarp_core::platform::InputSink;
+    use std::sync::atomic::Ordering;
+
+    match action {
+        Action::SendTakeControl { entry_y } => {
+            enqueue(remote, tx_out, Message::TakeControl { entry_y })
+        }
+        Action::SendReleaseControl { exit_y } => {
+            enqueue(remote, tx_out, Message::ReleaseControl { exit_y })
+        }
+        Action::SendMessage(msg) => enqueue(remote, tx_out, msg),
+        Action::WarpLocalCursor { x, y } => sink.warp_cursor_abs(x, y),
+        Action::HideLocalCursor => sink.hide_cursor(),
+        Action::ShowLocalCursor => sink.show_cursor(),
+        Action::StartSwallow => {
+            debug!(peer = %remote, "brain: StartSwallow (RemoteActive)");
+            swallow.store(true, Ordering::Relaxed);
+        }
+        Action::StopSwallow => {
+            debug!(peer = %remote, "brain: StopSwallow (LocalActive)");
+            swallow.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn enqueue(remote: SocketAddr, tx_out: &mpsc::Sender<Message>, msg: Message) {
+    match tx_out.try_send(msg) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(dropped)) => {
+            warn!(peer = %remote, ?dropped, "outbound full; dropping action-emitted message");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            debug!(peer = %remote, "outbound closed; action enqueue dropped");
         }
     }
 }
