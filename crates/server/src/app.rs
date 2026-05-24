@@ -668,7 +668,9 @@ async fn edge_brain_task(
             }
         };
         for action in actions {
-            execute_action(remote, action, &mut sink, &tx_out, &swallow, &mod_remap, &held);
+            execute_action(
+                remote, action, &mut sink, &tx_out, &swallow, &mod_remap, &held,
+            );
         }
     }
     TaskExit::EdgeBrainFailed("brain input channel closed".into())
