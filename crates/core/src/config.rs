@@ -1,281 +1,229 @@
-//! Configuration: TOML parsing + modifier remap.
+//! `~/.config/kmwarp/config.toml` (mac/linux) and
+//! `%APPDATA%\kmwarp\config.toml` (Windows) schema + loader.
 //!
-//! v1 lands the `[modifiers]` section that M7 needs. Other sections
-//! (`[peer]`, `[edge]`, `[tls]`) will land alongside their respective
-//! milestones (M1 already hardcodes peer addrs; M6 already uses
-//! `EdgeConfig::default()`; M9 adds TLS pinning). Keeping `Config` in
-//! one place from the start means later milestones just fill in the
-//! struct rather than introduce new files.
+//! Schema mirrors PLAN.md §Cross-cutting design → Config exactly:
+//!
+//! ```toml
+//! [peer]
+//! bind = "0.0.0.0:51423"       # server only
+//! connect = "10.0.0.5:51423"   # client only
+//! name = "merajs-mbp"
+//!
+//! [edge]
+//! side = "right"               # right|left|top|bottom; v1 hardcodes right
+//! remote_screen_px = [2560, 1440]
+//!
+//! [modifiers]
+//! cmd = "ctrl"
+//! option = "alt"
+//!
+//! [tls]
+//! pin_file = "~/.config/kmwarp/peer.pin"
+//! ```
+//!
+//! Each section is optional; missing sections / fields fall back to
+//! the spec defaults so a partial TOML still parses. `Config::default()`
+//! is the runtime fallback when the on-disk file is missing entirely.
+
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::error::ConfigError;
-use crate::platform::ModMask;
+use crate::modmap::ModRemap;
 
-/// Top-level config struct, mirroring the TOML schema in PLAN.md §Config.
-///
-/// Every section is optional at the TOML level so a partial config
-/// (e.g. just `[modifiers]`) still parses; missing fields fall back to
-/// the spec's documented defaults.
+/// Top-level config struct. Every section is `#[serde(default)]` so
+/// a partial config (e.g. just `[modifiers]`) parses cleanly.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub modifiers: ModifierConfig,
+    pub peer: PeerConfig,
+    pub edge: EdgeSection,
+    pub modifiers: ModRemap,
+    pub tls: TlsConfig,
 }
 
 impl Config {
-    /// Parse a config from a TOML string. Returns a typed error so
-    /// `fn main()` can surface a clean message to the user.
+    /// Parse a config from a TOML string.
     pub fn parse(toml_str: &str) -> Result<Self, ConfigError> {
-        toml::from_str(toml_str).map_err(|e| ConfigError::Parse(e.to_string()))
+        toml::from_str(toml_str).map_err(ConfigError::Parse)
     }
-}
 
-/// `[modifiers]` section.
-///
-/// Each field names what the corresponding **source-side** modifier
-/// should become on the **wire**. The destination platform then
-/// reinterprets the wire bits per its own convention.
-///
-/// Defaults (per PLAN.md §M7):
-/// - `cmd` (macOS Cmd / META bit)   → `Ctrl`
-/// - `option` (macOS Option / ALT)  → `Alt` (identity)
-/// - `control` (macOS Ctrl / CTRL)  → `Ctrl` (identity)
-/// - `shift` (macOS Shift / SHIFT)  → `Shift` (identity)
-#[derive(Debug, Clone, Copy, Deserialize)]
-pub struct ModifierConfig {
-    #[serde(default = "default_cmd")]
-    pub cmd: ModifierName,
-    #[serde(default = "default_option")]
-    pub option: ModifierName,
-    #[serde(default = "default_control")]
-    pub control: ModifierName,
-    #[serde(default = "default_shift")]
-    pub shift: ModifierName,
-}
+    /// Load from an explicit path. Errors on IO failure or TOML parse
+    /// failure; missing-file is the caller's concern.
+    pub fn load_from_path(path: &Path) -> Result<Self, ConfigError> {
+        let s = std::fs::read_to_string(path)?;
+        Self::parse(&s)
+    }
 
-impl Default for ModifierConfig {
-    fn default() -> Self {
-        Self {
-            cmd: default_cmd(),
-            option: default_option(),
-            control: default_control(),
-            shift: default_shift(),
+    /// Load from the OS-conventional config path:
+    /// - macOS: `~/.config/kmwarp/config.toml` (Linux XDG convention,
+    ///   per spec — NOT `~/Library/Application Support`)
+    /// - Linux: `$XDG_CONFIG_HOME/kmwarp/config.toml` via the
+    ///   `directories` crate
+    /// - Windows: `%APPDATA%\kmwarp\config.toml`
+    ///
+    /// Returns `Ok(Config::default())` if the file doesn't exist —
+    /// kmwarp is meant to run with sensible defaults out of the box.
+    /// Returns `Err(ConfigError::MissingDir)` if the platform doesn't
+    /// expose a home directory at all (rare, e.g. sandboxed contexts
+    /// without a `$HOME`).
+    pub fn load_default() -> Result<Self, ConfigError> {
+        let path = Self::default_config_path().ok_or(ConfigError::MissingDir)?;
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        Self::load_from_path(&path)
+    }
+
+    /// The OS-conventional config path for this platform. `None` if
+    /// the user's home directory cannot be resolved.
+    pub fn default_config_path() -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        {
+            // Per spec: `~/.config/kmwarp/config.toml` on macOS to match
+            // the Linux convention. `directories::ProjectDirs` would
+            // route us into `~/Library/Application Support` here, which
+            // the spec explicitly does not want.
+            directories::BaseDirs::new().map(|b| b.home_dir().join(".config/kmwarp/config.toml"))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            directories::ProjectDirs::from("", "", "kmwarp")
+                .map(|p| p.config_dir().join("config.toml"))
         }
     }
 }
 
-fn default_cmd() -> ModifierName {
-    ModifierName::Ctrl
-}
-fn default_option() -> ModifierName {
-    ModifierName::Alt
-}
-fn default_control() -> ModifierName {
-    ModifierName::Ctrl
-}
-fn default_shift() -> ModifierName {
-    ModifierName::Shift
+/// `[peer]` section. Both `bind` and `connect` are optional so the
+/// same `Config` struct shape works for server + client; each binary
+/// reads the field that applies to it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PeerConfig {
+    /// Server-side: `IP:PORT` to bind the listener on.
+    pub bind: Option<String>,
+    /// Client-side: `IP:PORT` of the server to dial.
+    pub connect: Option<String>,
+    /// Human-readable peer name, sent in the `Hello` handshake.
+    pub name: Option<String>,
 }
 
-/// Wire-side modifier name as it appears in the TOML config.
+/// `[edge]` section: cursor-crossing layout + remote screen
+/// dimensions.
 ///
-/// `meta` and `win` are interchangeable aliases for the bit-3 modifier
-/// (Cmd on macOS, Win key on Windows). `none` disables the source
-/// modifier — pressing it on the source side contributes no bit to the
-/// outgoing wire chord. Useful for "I never want Caps Lock to do
-/// anything" style configs.
+/// `side` defaults to `Right` (v1 hardcodes the Windows-right-of-Mac
+/// topology); v1.1's M11 config UI exposes the other sides.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EdgeSection {
+    pub side: EdgeSide,
+    pub remote_screen_px: Option<(u32, u32)>,
+}
+
+impl Default for EdgeSection {
+    fn default() -> Self {
+        Self {
+            side: EdgeSide::Right,
+            remote_screen_px: None,
+        }
+    }
+}
+
+/// Which screen edge crosses to the remote peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ModifierName {
-    Shift,
-    Ctrl,
-    Alt,
-    Meta,
-    #[serde(alias = "win")]
-    Win,
-    None,
+pub enum EdgeSide {
+    Right,
+    Left,
+    Top,
+    Bottom,
 }
 
-impl ModifierName {
-    /// The single-bit `ModMask` this name represents on the wire.
-    /// `None` returns `ModMask::default()` (no bits set).
-    pub fn to_mask(self) -> ModMask {
-        match self {
-            ModifierName::Shift => ModMask::SHIFT,
-            ModifierName::Ctrl => ModMask::CTRL,
-            ModifierName::Alt => ModMask::ALT,
-            ModifierName::Meta | ModifierName::Win => ModMask::META,
-            ModifierName::None => ModMask::default(),
-        }
-    }
-}
-
-impl ModifierConfig {
-    /// Build a [`ModRemap`] from this config. Captures the mapping at
-    /// the moment of the call — re-call after a config reload.
-    pub fn to_remap(self) -> ModRemap {
-        ModRemap {
-            shift_to: self.shift.to_mask(),
-            ctrl_to: self.control.to_mask(),
-            alt_to: self.option.to_mask(),
-            meta_to: self.cmd.to_mask(),
-        }
-    }
-}
-
-/// Modifier bit-to-bit remap table.
-///
-/// Applied at the wire encoding boundary (source → wire) by the server
-/// runtime. Each field names the destination [`ModMask`] each source
-/// bit maps to; combining sources is by bitwise-OR.
-///
-/// # Example
-///
-/// Default mapping (Cmd → Ctrl, Option → Alt, others identity):
-/// ```
-/// use kmwarp_core::config::{ModifierConfig, ModRemap};
-/// use kmwarp_core::platform::ModMask;
-///
-/// let remap = ModifierConfig::default().to_remap();
-///
-/// // Cmd+C on a Mac: source ModMask has META set.
-/// let result = remap.apply(ModMask::META);
-/// assert_eq!(result, ModMask::CTRL);
-/// ```
-#[derive(Debug, Clone, Copy)]
-pub struct ModRemap {
-    pub shift_to: ModMask,
-    pub ctrl_to: ModMask,
-    pub alt_to: ModMask,
-    pub meta_to: ModMask,
-}
-
-impl Default for ModRemap {
-    fn default() -> Self {
-        ModifierConfig::default().to_remap()
-    }
-}
-
-impl ModRemap {
-    /// Apply the remap to a source-side [`ModMask`], returning the
-    /// destination-side mask. Combining is OR — pressing Cmd+Shift on
-    /// the source with `cmd → Ctrl` produces `Ctrl | Shift` on the wire.
-    pub fn apply(&self, src: ModMask) -> ModMask {
-        let mut out = ModMask::default();
-        if src.contains(ModMask::SHIFT) {
-            out.insert(self.shift_to);
-        }
-        if src.contains(ModMask::CTRL) {
-            out.insert(self.ctrl_to);
-        }
-        if src.contains(ModMask::ALT) {
-            out.insert(self.alt_to);
-        }
-        if src.contains(ModMask::META) {
-            out.insert(self.meta_to);
-        }
-        out
-    }
-
-    /// Identity remap. Useful for tests and for the future
-    /// Mac-as-client direction where no remap is needed.
-    pub fn identity() -> Self {
-        Self {
-            shift_to: ModMask::SHIFT,
-            ctrl_to: ModMask::CTRL,
-            alt_to: ModMask::ALT,
-            meta_to: ModMask::META,
-        }
-    }
+/// `[tls]` section: cert pinning (M9).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// Filesystem path to the pinned peer cert SHA-256 (hex). Tilde
+    /// expansion is the binary's responsibility (`directories` /
+    /// `shellexpand`) — `core` stores the raw string.
+    pub pin_file: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    use crate::modmap::ModTarget;
 
     #[test]
-    fn default_remap_maps_cmd_to_ctrl() {
-        let r = ModRemap::default();
-        assert_eq!(r.apply(ModMask::META), ModMask::CTRL);
-    }
-
-    #[test]
-    fn default_remap_keeps_option_as_alt() {
-        let r = ModRemap::default();
-        assert_eq!(r.apply(ModMask::ALT), ModMask::ALT);
-    }
-
-    #[test]
-    fn default_remap_leaves_shift_and_ctrl_unchanged() {
-        let r = ModRemap::default();
-        assert_eq!(r.apply(ModMask::SHIFT), ModMask::SHIFT);
-        assert_eq!(r.apply(ModMask::CTRL), ModMask::CTRL);
-    }
-
-    #[test]
-    fn default_remap_combines_with_or() {
-        let r = ModRemap::default();
-        // Cmd + Shift → Ctrl + Shift.
-        let mut src = ModMask::default();
-        src.insert(ModMask::META);
-        src.insert(ModMask::SHIFT);
-        let out = r.apply(src);
-        assert!(out.contains(ModMask::CTRL));
-        assert!(out.contains(ModMask::SHIFT));
-        assert!(!out.contains(ModMask::META));
-    }
-
-    #[test]
-    fn empty_modmask_remaps_to_empty() {
-        let r = ModRemap::default();
-        assert_eq!(r.apply(ModMask::default()), ModMask::default());
-    }
-
-    #[test]
-    fn identity_remap_preserves_all_bits() {
-        let r = ModRemap::identity();
-        for m in [ModMask::SHIFT, ModMask::CTRL, ModMask::ALT, ModMask::META] {
-            assert_eq!(r.apply(m), m);
-        }
-    }
-
-    #[test]
-    fn parse_full_modifiers_section() {
-        let toml = r#"
-            [modifiers]
-            cmd = "ctrl"
-            option = "alt"
-            control = "ctrl"
-            shift = "shift"
-        "#;
-        let cfg = Config::parse(toml).expect("parse");
-        assert_eq!(cfg.modifiers.cmd, ModifierName::Ctrl);
-        assert_eq!(cfg.modifiers.option, ModifierName::Alt);
-    }
-
-    #[test]
-    fn parse_partial_modifiers_section_uses_defaults_for_missing() {
-        let toml = r#"
-            [modifiers]
-            cmd = "alt"
-        "#;
-        let cfg = Config::parse(toml).expect("parse");
-        assert_eq!(cfg.modifiers.cmd, ModifierName::Alt);
-        // option/control/shift fall back to spec defaults.
-        assert_eq!(cfg.modifiers.option, ModifierName::Alt);
-        assert_eq!(cfg.modifiers.control, ModifierName::Ctrl);
-        assert_eq!(cfg.modifiers.shift, ModifierName::Shift);
+    fn default_config_is_loadable_and_sensible() {
+        let cfg = Config::default();
+        assert!(cfg.peer.bind.is_none());
+        assert!(cfg.peer.connect.is_none());
+        assert_eq!(cfg.edge.side, EdgeSide::Right);
+        assert_eq!(cfg.modifiers.cmd, ModTarget::Ctrl);
+        assert_eq!(cfg.modifiers.option, ModTarget::Alt);
+        assert!(cfg.tls.pin_file.is_none());
     }
 
     #[test]
     fn parse_empty_config_yields_defaults() {
         let cfg = Config::parse("").expect("empty parses");
-        assert_eq!(cfg.modifiers.cmd, ModifierName::Ctrl);
+        assert_eq!(cfg.edge.side, EdgeSide::Right);
+        assert_eq!(cfg.modifiers.cmd, ModTarget::Ctrl);
     }
 
     #[test]
-    fn parse_rejects_unknown_modifier_name() {
+    fn full_toml_round_trips() {
+        let toml = r#"
+            [peer]
+            bind = "0.0.0.0:51423"
+            connect = "10.0.0.5:51423"
+            name = "merajs-mbp"
+
+            [edge]
+            side = "right"
+            remote_screen_px = [2560, 1440]
+
+            [modifiers]
+            cmd = "ctrl"
+            option = "alt"
+
+            [tls]
+            pin_file = "~/.config/kmwarp/peer.pin"
+        "#;
+        let cfg = Config::parse(toml).expect("parse");
+        assert_eq!(cfg.peer.bind.as_deref(), Some("0.0.0.0:51423"));
+        assert_eq!(cfg.peer.connect.as_deref(), Some("10.0.0.5:51423"));
+        assert_eq!(cfg.peer.name.as_deref(), Some("merajs-mbp"));
+        assert_eq!(cfg.edge.side, EdgeSide::Right);
+        assert_eq!(cfg.edge.remote_screen_px, Some((2560, 1440)));
+        assert_eq!(cfg.modifiers.cmd, ModTarget::Ctrl);
+        assert_eq!(cfg.modifiers.option, ModTarget::Alt);
+        assert_eq!(
+            cfg.tls.pin_file.as_deref(),
+            Some("~/.config/kmwarp/peer.pin")
+        );
+    }
+
+    #[test]
+    fn partial_toml_uses_defaults_for_missing_sections() {
+        let toml = r#"
+            [modifiers]
+            cmd = "alt"
+        "#;
+        let cfg = Config::parse(toml).expect("parse");
+        assert_eq!(cfg.modifiers.cmd, ModTarget::Alt);
+        // Other sections still get sensible defaults.
+        assert_eq!(cfg.edge.side, EdgeSide::Right);
+        assert!(cfg.peer.bind.is_none());
+        assert!(cfg.tls.pin_file.is_none());
+    }
+
+    #[test]
+    fn unknown_modifier_name_is_a_parse_error() {
         let toml = r#"
             [modifiers]
             cmd = "hyper"
@@ -284,40 +232,75 @@ mod tests {
     }
 
     #[test]
-    fn parse_accepts_win_alias_for_meta() {
-        let toml = r#"
-            [modifiers]
-            cmd = "win"
-        "#;
-        let cfg = Config::parse(toml).expect("parse");
-        assert_eq!(cfg.modifiers.cmd, ModifierName::Win);
-        // Both Win and Meta produce the same wire bit.
-        assert_eq!(ModifierName::Win.to_mask(), ModMask::META);
+    fn edge_side_accepts_all_four_directions() {
+        for (input, expected) in [
+            ("right", EdgeSide::Right),
+            ("left", EdgeSide::Left),
+            ("top", EdgeSide::Top),
+            ("bottom", EdgeSide::Bottom),
+        ] {
+            let toml = format!("[edge]\nside = \"{input}\"");
+            let cfg = Config::parse(&toml).expect("parse");
+            assert_eq!(cfg.edge.side, expected);
+        }
     }
 
     #[test]
-    fn none_modifier_drops_the_bit() {
-        let cfg = ModifierConfig {
-            cmd: ModifierName::None,
-            option: ModifierName::Alt,
-            control: ModifierName::Ctrl,
-            shift: ModifierName::Shift,
-        };
-        let remap = cfg.to_remap();
-        assert_eq!(remap.apply(ModMask::META), ModMask::default());
+    fn load_from_path_reads_a_real_file() {
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        writeln!(
+            f,
+            r#"
+                [modifiers]
+                cmd = "alt"
+                option = "ctrl"
+            "#
+        )
+        .unwrap();
+
+        let cfg = Config::load_from_path(f.path()).expect("load");
+        assert_eq!(cfg.modifiers.cmd, ModTarget::Alt);
+        assert_eq!(cfg.modifiers.option, ModTarget::Ctrl);
     }
 
     #[test]
-    fn custom_swap_remap() {
-        // Swap Cmd ↔ Ctrl: cmd → ctrl, control → meta.
-        let cfg = ModifierConfig {
-            cmd: ModifierName::Ctrl,
-            option: ModifierName::Alt,
-            control: ModifierName::Meta,
-            shift: ModifierName::Shift,
-        };
-        let remap = cfg.to_remap();
-        assert_eq!(remap.apply(ModMask::META), ModMask::CTRL);
-        assert_eq!(remap.apply(ModMask::CTRL), ModMask::META);
+    fn load_from_path_returns_io_error_on_missing_file() {
+        let bogus = PathBuf::from("/nonexistent/kmwarp-test-1234/config.toml");
+        match Config::load_from_path(&bogus) {
+            Err(ConfigError::Io(_)) => {}
+            other => panic!("expected IO error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_default_returns_default_when_file_absent() {
+        // We can't reliably guarantee the user's config dir is empty,
+        // so we verify the documented contract directly:
+        // `load_default()` returns `Ok(Default)` when the file at
+        // `default_config_path()` doesn't exist.
+        if let Some(path) = Config::default_config_path() {
+            if !path.exists() {
+                let cfg = Config::load_default().expect("default ok");
+                // Sanity: it's the default shape.
+                assert_eq!(cfg.modifiers.cmd, ModTarget::Ctrl);
+            }
+        }
+    }
+
+    #[test]
+    fn default_config_path_resolves_on_this_platform() {
+        // Just assert the path resolves — content may not exist.
+        let path = Config::default_config_path();
+        assert!(path.is_some(), "no home dir available?");
+        let path = path.unwrap();
+        // On macOS the spec says ~/.config/kmwarp/config.toml.
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                path.to_string_lossy()
+                    .contains(".config/kmwarp/config.toml"),
+                "macOS path should follow XDG convention: {path:?}"
+            );
+        }
     }
 }
