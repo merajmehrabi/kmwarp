@@ -43,5 +43,7 @@ async-trait = { workspace = true }
 core-graphics = { workspace = true }
 core-foundation = { workspace = true }
 objc2 = { workspace = true }
-objc2-app-kit = { workspace = true }
-objc2-foundation = { workspace = true }
+# `NSPasteboard` feature gates the clipboard module from objc2-app-kit
+# (the crate is feature-gated per Apple framework class). M8 uses it.
+objc2-app-kit = { workspace = true, features = ["NSPasteboard"] }
+objc2-foundation = { workspace = true, features = ["NSString"] }
