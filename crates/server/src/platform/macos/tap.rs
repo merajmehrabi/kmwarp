@@ -33,6 +33,7 @@
 //! pointer (published through an `OnceLock<usize>` shared with the outer
 //! thread).
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, OnceLock};
@@ -93,12 +94,19 @@ impl MacInputSource {
         let tap_thread = thread::Builder::new()
             .name("kmwarp-cgtap".into())
             .spawn(move || {
+                // Per-modifier-keycode "currently held" bitmap, lives only
+                // on the tap thread (the closure runs single-threaded inside
+                // its CFRunLoop, so `Cell` is sufficient — no Mutex needed).
+                // See `translate_flags_changed` for the index layout.
+                let held_mods: Cell<u32> = Cell::new(0);
                 let tap_result = CGEventTap::new(
                     CGEventTapLocation::HID,
                     CGEventTapPlacement::HeadInsertEventTap,
                     CGEventTapOptions::Default,
                     interest_mask(),
-                    move |_proxy, etype, event| callback(etype, event, &event_tx, &port_for_cb),
+                    move |_proxy, etype, event| {
+                        callback(etype, event, &event_tx, &port_for_cb, &held_mods)
+                    },
                 );
 
                 let tap = match tap_result {
@@ -197,6 +205,7 @@ fn callback(
     event: &CGEvent,
     tx: &mpsc::UnboundedSender<SourceEvent>,
     port_holder: &OnceLock<usize>,
+    held_mods: &Cell<u32>,
 ) -> Option<CGEvent> {
     match etype {
         CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
@@ -213,7 +222,7 @@ fn callback(
         }
         _ => {}
     }
-    if let Some(ev) = translate(etype, event) {
+    if let Some(ev) = translate(etype, event, held_mods) {
         // Unbounded send; only fails if the receiver was dropped (consumer
         // gone). In that case the source is being torn down and the run
         // loop will stop shortly via the shutdown watcher.
@@ -247,7 +256,7 @@ fn interest_mask() -> Vec<CGEventType> {
     ]
 }
 
-fn translate(etype: CGEventType, event: &CGEvent) -> Option<SourceEvent> {
+fn translate(etype: CGEventType, event: &CGEvent, held_mods: &Cell<u32>) -> Option<SourceEvent> {
     use CGEventType::{
         FlagsChanged, KeyDown, KeyUp, LeftMouseDown, LeftMouseDragged, LeftMouseUp, MouseMoved,
         OtherMouseDown, OtherMouseDragged, OtherMouseUp, RightMouseDown, RightMouseDragged,
@@ -297,8 +306,82 @@ fn translate(etype: CGEventType, event: &CGEvent) -> Option<SourceEvent> {
         }
         KeyDown => translate_key(event, KeyState::Down),
         KeyUp => translate_key(event, KeyState::Up),
-        // M5 second commit wires FlagsChanged through the held-keycode tracker.
-        FlagsChanged => None,
+        FlagsChanged => translate_flags_changed(event, held_mods),
+        _ => None,
+    }
+}
+
+/// Translate `kCGEventFlagsChanged` into a `SourceEvent::Key { state: … }`.
+///
+/// macOS doesn't tell us up vs. down directly on a flags-changed event;
+/// it delivers the keycode of the modifier that just transitioned and the
+/// *new* aggregate `CGEventFlags`. The teammate spec suggested XOR'ing the
+/// old vs. new flags integer — but that's ambiguous when the user already
+/// holds (say) Left Shift and then presses Right Shift, since the
+/// aggregate `CGEventFlagShift` bit doesn't flip. So we keep a per-keycode
+/// held-bitmap instead: every FlagsChanged for a tracked modifier vk
+/// flips its bit, and "was previously held" → it's an Up.
+///
+/// Returns `None` (with a `trace!`) when:
+///   - the vk isn't a modifier we track (e.g. raw `Fn` 0x3F — present in
+///     the macOS keyboard but not in v1's HID table);
+///   - the modifier's HID code isn't in `MACOS_VK_TO_HID` (paranoia: the
+///     two should always agree for the keycodes in [`mod_bit`]).
+///
+/// The emitted `mods` field reflects the *aggregate* flags *after* the
+/// transition, which is what the wire-format byte semantically means.
+fn translate_flags_changed(event: &CGEvent, held: &Cell<u32>) -> Option<SourceEvent> {
+    let cg_vk = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+    let bit_idx = match mod_bit(cg_vk) {
+        Some(b) => b,
+        None => {
+            trace!(?cg_vk, "FlagsChanged: vk is not a tracked modifier; dropping");
+            return None;
+        }
+    };
+    let bit = 1u32 << bit_idx;
+    let prev = held.get();
+    let was_held = (prev & bit) != 0;
+    held.set(prev ^ bit);
+    let state = if was_held {
+        KeyState::Up
+    } else {
+        KeyState::Down
+    };
+
+    let hid = match macos_to_hid(cg_vk) {
+        Some(h) => h,
+        None => {
+            trace!(?cg_vk, ?state, "FlagsChanged: vk has no HID mapping; dropping");
+            return None;
+        }
+    };
+    let mods = mods_from_flags(event.get_flags());
+    Some(SourceEvent::Key {
+        hid_usage: hid,
+        state,
+        mods,
+    })
+}
+
+/// Bit index in the held-modifier bitmap for each modifier macOS VK we
+/// track. The ordering is purely a private detail of the tap state; the
+/// only contract is that each tracked vk maps to a unique bit.
+///
+/// Includes both-side variants for Shift/Ctrl/Option/Command plus Caps
+/// Lock. The `Fn` key (0x3F) is intentionally omitted — it isn't in the
+/// v1 HID table and would only confuse downstream consumers.
+fn mod_bit(vk: u16) -> Option<u8> {
+    match vk {
+        0x38 => Some(0), // kVK_Shift   (left)
+        0x3C => Some(1), // kVK_RightShift
+        0x3B => Some(2), // kVK_Control (left)
+        0x3E => Some(3), // kVK_RightControl
+        0x3A => Some(4), // kVK_Option  (left, alt)
+        0x3D => Some(5), // kVK_RightOption
+        0x37 => Some(6), // kVK_Command (left)
+        0x36 => Some(7), // kVK_RightCommand
+        0x39 => Some(8), // kVK_CapsLock
         _ => None,
     }
 }
@@ -422,6 +505,64 @@ mod tests {
             m
         };
         assert_eq!(mods_from_flags(all), expected);
+    }
+
+    #[test]
+    fn mod_bit_assigns_unique_indices_for_tracked_modifiers() {
+        // Every documented mod VK gets a unique bit index 0..=8; an
+        // off-list VK returns None.
+        let vks = [0x38, 0x3C, 0x3B, 0x3E, 0x3A, 0x3D, 0x37, 0x36, 0x39];
+        let mut seen = std::collections::HashSet::new();
+        for vk in vks {
+            let bit = mod_bit(vk).expect("tracked modifier vk should map");
+            assert!(bit < 9, "bit index {bit} out of range");
+            assert!(seen.insert(bit), "duplicate bit index for vk 0x{vk:X}");
+        }
+        // A letter (kVK_ANSI_A = 0x00) and the Fn key (0x3F) are not
+        // tracked modifiers.
+        assert_eq!(mod_bit(0x00), None);
+        assert_eq!(mod_bit(0x3F), None);
+    }
+
+    #[test]
+    fn flags_changed_held_tracker_flips_state_per_keycode() {
+        // Walk the bitmap directly — we can't fabricate a CGEvent in a
+        // unit test, so we exercise the state transition logic by
+        // re-implementing the same flip-and-test sequence the
+        // `translate_flags_changed` code path uses.
+        let held: Cell<u32> = Cell::new(0);
+
+        // Press Left Shift (vk 0x38, bit 0): was_held false → Down.
+        let bit_l = 1u32 << mod_bit(0x38).unwrap();
+        let prev = held.get();
+        let was_held = (prev & bit_l) != 0;
+        held.set(prev ^ bit_l);
+        assert!(!was_held);
+        assert_eq!(held.get(), bit_l);
+
+        // Press Right Shift (vk 0x3C, bit 1) while Left still held:
+        // was_held false → Down. Aggregate Shift bit would have been
+        // unchanged, but per-key state is correct.
+        let bit_r = 1u32 << mod_bit(0x3C).unwrap();
+        let prev = held.get();
+        let was_held = (prev & bit_r) != 0;
+        held.set(prev ^ bit_r);
+        assert!(!was_held);
+        assert_eq!(held.get(), bit_l | bit_r);
+
+        // Release Right Shift: was_held true → Up.
+        let prev = held.get();
+        let was_held = (prev & bit_r) != 0;
+        held.set(prev ^ bit_r);
+        assert!(was_held);
+        assert_eq!(held.get(), bit_l);
+
+        // Release Left Shift: was_held true → Up.
+        let prev = held.get();
+        let was_held = (prev & bit_l) != 0;
+        held.set(prev ^ bit_l);
+        assert!(was_held);
+        assert_eq!(held.get(), 0);
     }
 
     #[test]
