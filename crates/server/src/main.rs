@@ -6,6 +6,8 @@
 //! Environment:
 //!   * `KMWARP_BIND` — listen address (default `0.0.0.0:51423`).
 //!   * `KMWARP_PEER_NAME` — name advertised to peers (default `kmwarp-server`).
+//!   * `KMWARP_M2_DEMO=1` (macOS only) — bypass the normal server and run
+//!     the M2 CGEventTap acceptance harness instead.
 //!   * `RUST_LOG` — standard tracing filter (default `kmwarp=info`).
 
 use std::env;
@@ -27,6 +29,14 @@ async fn main() -> Result<()> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("kmwarp=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    // M2 acceptance demo: short-circuit the normal server when the hook is
+    // set. macOS-only because it depends on `CGEventTap`. On other platforms
+    // the env var is ignored.
+    #[cfg(target_os = "macos")]
+    if env::var("KMWARP_M2_DEMO").ok().as_deref() == Some("1") {
+        return kmwarp_server::platform::macos::m2_demo::run().await;
+    }
 
     let bind_str = env::var("KMWARP_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     let bind: SocketAddr = bind_str
