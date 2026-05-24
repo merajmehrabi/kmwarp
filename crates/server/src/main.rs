@@ -1,15 +1,38 @@
-//! kmwarp-server entry point (macOS).
+//! kmwarp-server entry point.
 //!
-//! M0 placeholder: initialize tracing and log a startup line.
+//! Reads bind address and peer name from the environment, initializes
+//! `tracing`, and hands off to [`kmwarp_server::app::run_server`].
+//!
+//! Environment:
+//!   * `KMWARP_BIND` — listen address (default `0.0.0.0:51423`).
+//!   * `KMWARP_PEER_NAME` — name advertised to peers (default `kmwarp-server`).
+//!   * `RUST_LOG` — standard tracing filter (default `kmwarp=info`).
 
+use std::env;
+use std::net::SocketAddr;
+
+use anyhow::{Context, Result};
+use kmwarp_server::app::run_server;
 use tracing_subscriber::EnvFilter;
 
-fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+const DEFAULT_BIND: &str = "0.0.0.0:51423";
+const DEFAULT_PEER_NAME: &str = "kmwarp-server";
 
-    tracing::info!("hello from kmwarp-server");
+#[tokio::main]
+async fn main() -> Result<()> {
+    // RUST_LOG (if set) wins; otherwise default to `kmwarp=info`. We
+    // intentionally don't `.add_directive("kmwarp=info")` on top of the env
+    // filter, because EnvFilter replaces same-target directives, which would
+    // demote any `RUST_LOG=kmwarp=debug` back to `info`.
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("kmwarp=info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    let bind_str = env::var("KMWARP_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
+    let bind: SocketAddr = bind_str
+        .parse()
+        .with_context(|| format!("parsing KMWARP_BIND={bind_str:?}"))?;
+    let peer_name = env::var("KMWARP_PEER_NAME").unwrap_or_else(|_| DEFAULT_PEER_NAME.to_string());
+
+    run_server(bind, &peer_name).await
 }
