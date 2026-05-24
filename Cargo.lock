@@ -464,6 +464,7 @@ name = "kmwarp-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "directories",
  "hex",
  "kmwarp-core",
@@ -499,6 +500,7 @@ name = "kmwarp-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "core-foundation",
  "core-graphics",
  "directories",
