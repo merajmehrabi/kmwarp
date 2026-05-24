@@ -124,6 +124,20 @@ const FALLBACK_SCREEN_PX: (u16, u16) = (1920, 1080);
 #[cfg(target_os = "macos")]
 const BRAIN_CHANNEL_BOUND: usize = 256;
 
+/// M7 graceful-disconnect drain: per-send timeout when pushing a
+/// synthesized `KeyEvent { Up }` into the outbound channel. Each held
+/// HID gets one send attempt; the overall disconnect path is bounded
+/// at roughly `held.len() * this`.
+#[cfg(target_os = "macos")]
+const GRACEFUL_DRAIN_PER_SEND_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// M7 graceful-disconnect drain: best-effort wait after queueing the
+/// releases for the encoder to flush them to the peer. We can't
+/// directly observe "encoder flushed N messages" — this is a heuristic
+/// based on the encoder having consumed at least one slot.
+#[cfg(target_os = "macos")]
+const GRACEFUL_DRAIN_FLUSH_DEADLINE: Duration = Duration::from_millis(200);
+
 /// Mouse pump → outbound coalescing threshold. When the bounded outbound
 /// channel is full, a `MouseMoveRel` `try_send` failure triggers an
 /// in-place coalesce: the next dropped move's delta is merged into the
@@ -285,24 +299,47 @@ async fn handle_peer(
         Arc::clone(&latency_state),
     ));
 
-    // Drop the original sender so the channel can close when all task-held
-    // clones are dropped (graceful drain on shutdown).
-    drop(tx_out);
+    // Drop the brain channel sender so brain can shut down cleanly
+    // when the source forwarder exits. tx_out is intentionally kept
+    // alive in *this* scope so the post-disconnect M7 drain can still
+    // push synthesized `KeyEvent { Up }` releases into the encoder
+    // before we abort siblings.
     #[cfg(target_os = "macos")]
     drop(brain_tx);
 
-    run_until_first_exit(remote, set).await;
+    // Wait for the first task to exit, then run the M7 graceful-
+    // disconnect drain: synthesize Up events for every key still held
+    // and give the encoder a brief window to flush them to the peer
+    // before tearing down. SIGKILL paths bypass this — the client is
+    // responsible for synthesizing local releases on EOF (the spec's
+    // "Windows side sees a clean release" invariant is satisfied by
+    // either side; the graceful path is just lower-friction).
+    let first_exit = wait_for_first_exit(remote, &mut set).await;
+    #[cfg(target_os = "macos")]
+    drain_held_on_disconnect(remote, &tx_out, &held).await;
+    drop(tx_out);
+    drain_remaining_tasks(remote, set).await;
+    debug!(peer = %remote, ?first_exit, "handle_peer exiting");
     info!(peer = %remote, "peer session ended");
     Ok(())
 }
 
-/// Wait for any task to exit, then abort + drain siblings so logs land
-/// in a coherent order before returning.
-async fn run_until_first_exit(remote: SocketAddr, mut set: JoinSet<TaskExit>) {
-    if let Some(joined) = set.join_next().await {
-        let exit = joined.unwrap_or(TaskExit::JoinError);
-        log_exit(remote, exit);
-    }
+/// Wait for the first sub-task to exit. Returns a flag for the caller
+/// to log. The remaining tasks are still running on return; the caller
+/// should run the M7 drain (if applicable) and then call
+/// [`drain_remaining_tasks`].
+async fn wait_for_first_exit(remote: SocketAddr, set: &mut JoinSet<TaskExit>) -> TaskExit {
+    let exit = match set.join_next().await {
+        Some(joined) => joined.unwrap_or(TaskExit::JoinError),
+        None => TaskExit::JoinError,
+    };
+    log_exit(remote, exit_kind(&exit));
+    exit
+}
+
+/// Abort the surviving sub-tasks and drain the `JoinSet` so logs land
+/// in a coherent order before `handle_peer` returns.
+async fn drain_remaining_tasks(remote: SocketAddr, mut set: JoinSet<TaskExit>) {
     set.abort_all();
     while let Some(joined) = set.join_next().await {
         match joined {
@@ -311,6 +348,112 @@ async fn run_until_first_exit(remote: SocketAddr, mut set: JoinSet<TaskExit>) {
             Err(e) => debug!(peer = %remote, error = %e, "sibling task join error"),
         }
     }
+}
+
+/// Helper for cloning a TaskExit into the variant log_exit prefers
+/// (which takes ownership). Cheap: variants are small enums + Strings;
+/// we duplicate the String for the log.
+fn exit_kind(exit: &TaskExit) -> TaskExit {
+    match exit {
+        TaskExit::EncoderFailed(s) => TaskExit::EncoderFailed(s.clone()),
+        TaskExit::EncoderClosed => TaskExit::EncoderClosed,
+        TaskExit::HeartbeatFailed(s) => TaskExit::HeartbeatFailed(s.clone()),
+        TaskExit::ReaderFailed(s) => TaskExit::ReaderFailed(s.clone()),
+        TaskExit::DeadlineExpired => TaskExit::DeadlineExpired,
+        #[cfg(target_os = "macos")]
+        TaskExit::SourceForwarderFailed(s) => TaskExit::SourceForwarderFailed(s.clone()),
+        #[cfg(target_os = "macos")]
+        TaskExit::EdgeBrainFailed(s) => TaskExit::EdgeBrainFailed(s.clone()),
+        #[cfg(feature = "latency-probe")]
+        TaskExit::LatencyProberFailed(s) => TaskExit::LatencyProberFailed(s.clone()),
+        TaskExit::JoinError => TaskExit::JoinError,
+    }
+}
+
+/// **M7 graceful-disconnect drain.** After the first sub-task has
+/// exited (peer Bye, deadline timeout, reader EOF, encoder failure)
+/// but BEFORE we abort the siblings, snapshot the held-keys tracker
+/// and push a `KeyEvent { state: Up, modifiers: 0 }` for every still-
+/// held HID into the outbound queue. Then wait up to
+/// [`GRACEFUL_DRAIN_DEADLINE`] for the encoder to flush the releases
+/// to the peer (whichever happens first: flush completes or deadline
+/// fires).
+///
+/// Why best-effort: if the encoder is what exited first (its socket
+/// died), the tx_out queue will accept the messages but they'll never
+/// reach the peer. That's fine — the SIGKILL/RST path is windows-dev's
+/// problem to handle on the client side (the client synthesizes local
+/// releases on TCP EOF). The graceful path is just the lower-friction
+/// way when the server *can* still write.
+///
+/// This function is `async` because the drain wait uses
+/// `tx_out.reserve()` and `tokio::time::timeout`. The lock window is
+/// brief — we hold it only long enough to drain the tracker into a
+/// local `Vec<u16>`.
+#[cfg(target_os = "macos")]
+async fn drain_held_on_disconnect(
+    remote: SocketAddr,
+    tx_out: &mpsc::Sender<Message>,
+    held: &std::sync::Arc<std::sync::Mutex<kmwarp_core::stuck_keys::HeldKeys>>,
+) {
+    use kmwarp_core::wire::key_state_code;
+
+    let hids: Vec<u16> = match held.lock() {
+        Ok(mut h) => h.drain(),
+        Err(poisoned) => {
+            warn!(peer = %remote, "HeldKeys mutex poisoned on disconnect; recovering");
+            poisoned.into_inner().drain()
+        }
+    };
+    if hids.is_empty() {
+        return;
+    }
+    warn!(
+        peer = %remote,
+        count = hids.len(),
+        "M7: draining held keys on graceful disconnect"
+    );
+
+    // Use the `await` variant of send so we don't lose releases when
+    // tx_out has filled up — this path is rare (only fires once per
+    // disconnect) and correctness matters more than rate here. Each
+    // send gets its own short timeout so a wedged encoder can't hang
+    // the disconnect path indefinitely.
+    for hid in hids {
+        let msg = Message::KeyEvent {
+            hid_usage: hid,
+            state: key_state_code::UP,
+            modifiers: 0,
+        };
+        match tokio::time::timeout(GRACEFUL_DRAIN_PER_SEND_TIMEOUT, tx_out.send(msg)).await {
+            Ok(Ok(())) => trace!(peer = %remote, hid, "queued disconnect-drain release"),
+            Ok(Err(_)) => {
+                debug!(
+                    peer = %remote,
+                    hid,
+                    "outbound closed during disconnect drain — peer unreachable"
+                );
+                return;
+            }
+            Err(_) => {
+                warn!(
+                    peer = %remote,
+                    hid,
+                    "disconnect-drain send timed out; encoder likely wedged"
+                );
+                return;
+            }
+        }
+    }
+
+    // Best-effort flush wait: give the encoder up to
+    // GRACEFUL_DRAIN_FLUSH_DEADLINE to process the messages we just
+    // queued. We can't directly observe "encoder flushed N
+    // messages"; the proxy here is `tx_out.reserve()`, which awaits
+    // until at least one slot is free — which only happens after the
+    // encoder drains at least one message past the high-water mark.
+    // It's a heuristic, not a guarantee.
+    let _ = tokio::time::timeout(GRACEFUL_DRAIN_FLUSH_DEADLINE, tx_out.reserve()).await;
 }
 
 /// Discriminant for which sub-task exited and why.
