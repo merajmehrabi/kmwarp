@@ -4,14 +4,17 @@
 //! layer translates at the boundary. This module owns the truth tables for
 //! both directions:
 //!
-//! - [`macos::macos_to_hid`] — macOS virtual keycode → HID usage. Server
-//!   uses this to encode `kCGEventKeyDown/Up` events for the wire.
+//! - [`macos::macos_to_hid`] / [`macos::hid_to_macos`] — macOS virtual
+//!   keycode ↔ HID usage. Server uses the forward direction to encode
+//!   `kCGEventKeyDown/Up` events for the wire.
 //! - [`windows::windows_to_hid`] — Win32 VK → HID usage. Reserved for the
 //!   future Mac-as-client path; not used in v1 unidirectional flow.
-//! - [`windows::hid_to_scancode`] — HID usage → PS/2 Set-1 scancode. Client
-//!   uses this with `KEYEVENTF_SCANCODE` for layout-independent injection.
+//! - [`windows::hid_to_windows_scancode`] — HID usage → PS/2 Set-1 scancode
+//!   wrapped in a [`windows::WinScancode`] (code + extended flag). Client
+//!   feeds this to `SendInput` with `KEYEVENTF_SCANCODE` for
+//!   layout-independent injection.
 //!
-//! Tables are `pub const &[(u16, u16)]` slices. Linear-scan lookups; ~80
+//! Tables are `pub const &[(u16, _)]` slices. Linear-scan lookups; ~80
 //! entries, called at human typing rate, so the hash-map overhead isn't
 //! worth it.
 //!
@@ -22,8 +25,20 @@
 pub mod macos;
 pub mod windows;
 
-pub use macos::{macos_to_hid, MACOS_VK_TO_HID};
-pub use windows::{hid_to_scancode, windows_to_hid, HID_TO_SCANCODE, WIN32_VK_TO_HID};
+/// USB HID Usage Page 0x07 key code. Pure documentation alias for `u16`
+/// — keeps function signatures self-explanatory without a newtype's
+/// ergonomic cost.
+pub type HidUsage = u16;
+
+pub use macos::{hid_to_macos, macos_to_hid, MACOS_VK_TO_HID};
+pub use windows::{
+    hid_to_windows_scancode, windows_to_hid, WinScancode, HID_TO_SCANCODE, WIN32_VK_TO_HID,
+};
+
+// Compat re-exports for the in-flight Windows M5 inject path; new
+// callers should prefer `hid_to_windows_scancode` returning `WinScancode`.
+#[doc(hidden)]
+pub use windows::{hid_to_scancode, is_extended_scancode, scancode_low_byte};
 
 /// Named HID usage codes for the keys v1 cares about. Kept here so tests
 /// and downstream callers can reference `usage::A` instead of `0x04`.

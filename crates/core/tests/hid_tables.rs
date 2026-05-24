@@ -1,7 +1,7 @@
-//! HID table invariants + ASCII coverage spot-checks.
+//! HID table invariants + ASCII coverage spot-checks + ModMask wire codec.
 //!
-//! Every translation table in `core::hid` is a `&[(u16, u16)]` const
-//! slice. These tests pin the invariants the platform layers depend on:
+//! Tables in `core::hid` are `&[(u16, _)]` const slices. These tests pin
+//! the invariants the platform layers depend on:
 //!
 //! - **Bijection**: no two source codes map to the same destination, and
 //!   no two destination codes are produced by different sources. A
@@ -11,21 +11,30 @@
 //! - **Modifier closure**: the four modifier classes (Ctrl/Shift/Alt/GUI)
 //!   each have both left and right entries in both tables.
 //! - **Extended-key convention**: keys we expect to be extended (arrows,
-//!   nav cluster, RCtrl, RAlt, both GUIs) report `is_extended_scancode`,
-//!   and non-extended keys do not.
+//!   nav cluster) come back with `extended: true`; letters do not.
+//! - **macOS Delete confusion guard**: `kVK_Delete` (0x33) → HID 0x2A
+//!   (Backspace), and `kVK_ForwardDelete` (0x75) → HID 0x4C (Delete).
+//!   These two are the easiest HID newbie trap.
+//! - **ModMask wire round-trip** masks off reserved bits 4-7 for every
+//!   possible input byte.
 
 use std::collections::HashSet;
 
 use kmwarp_core::hid::{
-    hid_to_scancode, macos_to_hid, usage, windows::is_extended_scancode, windows_to_hid,
-    HID_TO_SCANCODE, MACOS_VK_TO_HID, WIN32_VK_TO_HID,
+    hid_to_macos, hid_to_windows_scancode, macos_to_hid, usage, windows_to_hid, HID_TO_SCANCODE,
+    MACOS_VK_TO_HID, WIN32_VK_TO_HID,
 };
+use kmwarp_core::ModMask;
 
-/// Helper: assert that no source value is repeated and no destination
-/// value is repeated in a `(source, dest)` slice.
-fn assert_bijection(label: &str, table: &[(u16, u16)]) {
+/// Helper: assert no source value is repeated and no destination value is
+/// repeated. Generic over the destination type so we can re-use this for
+/// `(u16, u16)` and `(u16, _)` tables.
+fn assert_bijection<T: Copy + std::fmt::Debug + std::hash::Hash + Eq>(
+    label: &str,
+    table: &[(u16, T)],
+) {
     let mut sources = HashSet::with_capacity(table.len());
-    let mut dests = HashSet::with_capacity(table.len());
+    let mut dests: HashSet<T> = HashSet::with_capacity(table.len());
     for (src, dst) in table {
         assert!(
             sources.insert(*src),
@@ -33,7 +42,7 @@ fn assert_bijection(label: &str, table: &[(u16, u16)]) {
         );
         assert!(
             dests.insert(*dst),
-            "{label}: duplicate destination code 0x{dst:04X}"
+            "{label}: duplicate destination value {dst:?}"
         );
     }
 }
@@ -54,12 +63,19 @@ fn hid_to_scancode_is_a_bijection() {
 }
 
 #[test]
-fn macos_lookup_helper_matches_table() {
+fn macos_forward_and_reverse_are_mutual_inverses() {
     for (vk, hid) in MACOS_VK_TO_HID {
         assert_eq!(macos_to_hid(*vk), Some(*hid));
+        assert_eq!(
+            hid_to_macos(*hid),
+            Some(*vk),
+            "hid_to_macos(0x{hid:04X}) should round-trip to 0x{vk:04X}"
+        );
     }
     // VK 0xFF is not in any kVK_* constant; helper should reject it.
     assert_eq!(macos_to_hid(0xFF), None);
+    // HID 0xFFFF is outside Page 0x07; reverse should also be None.
+    assert_eq!(hid_to_macos(0xFFFF), None);
 }
 
 #[test]
@@ -67,19 +83,24 @@ fn windows_lookup_helpers_match_tables() {
     for (vk, hid) in WIN32_VK_TO_HID {
         assert_eq!(windows_to_hid(*vk), Some(*hid));
     }
-    for (hid, sc) in HID_TO_SCANCODE {
-        assert_eq!(hid_to_scancode(*hid), Some(*sc));
+    for (hid, packed) in HID_TO_SCANCODE {
+        let sc = hid_to_windows_scancode(*hid).expect("scancode lookup succeeds");
+        // The struct must reflect the packed table value exactly.
+        let expected_extended = (packed >> 8) == 0xE0;
+        let expected_code = packed & 0x00FF;
+        assert_eq!(sc.code, expected_code, "code for HID 0x{hid:04X}");
+        assert_eq!(
+            sc.extended, expected_extended,
+            "extended for HID 0x{hid:04X}"
+        );
     }
     // Bogus HID code (out of Page 0x07 range we cover) → None.
-    assert_eq!(hid_to_scancode(0xFFFF), None);
+    assert_eq!(hid_to_windows_scancode(0xFFFF), None);
 }
 
 #[test]
 fn ascii_alphabet_roundtrips_macos_vk_to_hid_to_scancode() {
-    // For every letter a..z we should find a macOS VK, a Windows
-    // scancode, and the HID code should match `usage::<LETTER>`.
     let letters: &[(u16, u16)] = &[
-        // (macos_vk, expected_hid_usage)
         (0x00, usage::A),
         (0x0B, usage::B),
         (0x08, usage::C),
@@ -111,12 +132,10 @@ fn ascii_alphabet_roundtrips_macos_vk_to_hid_to_scancode() {
         let hid =
             macos_to_hid(*mac_vk).unwrap_or_else(|| panic!("no HID for mac VK {mac_vk:#04X}"));
         assert_eq!(hid, *expected_hid, "letter at mac VK {mac_vk:#04X}");
-        let sc = hid_to_scancode(hid).unwrap_or_else(|| panic!("no scancode for HID {hid:#04X}"));
-        assert_ne!(sc, 0, "letter scancodes are non-zero");
-        assert!(
-            !is_extended_scancode(sc),
-            "letter scancodes are not extended"
-        );
+        let sc = hid_to_windows_scancode(hid)
+            .unwrap_or_else(|| panic!("no scancode for HID {hid:#04X}"));
+        assert_ne!(sc.code, 0, "letter scancodes are non-zero");
+        assert!(!sc.extended, "letter scancodes are not extended");
     }
 }
 
@@ -136,13 +155,12 @@ fn digits_roundtrip() {
     ];
     for (mac_vk, expected_hid) in digits {
         assert_eq!(macos_to_hid(*mac_vk), Some(*expected_hid));
-        assert!(hid_to_scancode(*expected_hid).is_some());
+        assert!(hid_to_windows_scancode(*expected_hid).is_some());
     }
 }
 
 #[test]
 fn common_punctuation_roundtrips() {
-    // mac_vk → expected_hid for keys M5 acceptance requires
     let entries: &[(u16, u16)] = &[
         (0x24, usage::ENTER),
         (0x35, usage::ESCAPE),
@@ -164,10 +182,32 @@ fn common_punctuation_roundtrips() {
     for (mac_vk, expected_hid) in entries {
         assert_eq!(macos_to_hid(*mac_vk), Some(*expected_hid));
         assert!(
-            hid_to_scancode(*expected_hid).is_some(),
+            hid_to_windows_scancode(*expected_hid).is_some(),
             "missing scancode for HID {expected_hid:#04X}"
         );
     }
+}
+
+#[test]
+fn macos_delete_keys_are_distinct() {
+    // The two macOS Delete keys are the classic HID newbie trap:
+    //   kVK_Delete (0x33) — the main "delete" key (above Return on a Mac
+    //   keyboard) — maps to HID 0x2A (USB HID Keyboard "DELETE", which is
+    //   actually Backspace in PC parlance).
+    //   kVK_ForwardDelete (0x75) — fn+delete or the dedicated Forward
+    //   Delete key — maps to HID 0x4C (USB HID Keyboard "Delete Forward").
+    assert_eq!(
+        macos_to_hid(0x33),
+        Some(0x2A),
+        "kVK_Delete should map to HID 0x2A (Backspace)"
+    );
+    assert_eq!(
+        macos_to_hid(0x75),
+        Some(0x4C),
+        "kVK_ForwardDelete should map to HID 0x4C (Delete Forward)"
+    );
+    assert_eq!(usage::BACKSPACE, 0x2A);
+    assert_eq!(usage::DELETE, 0x4C);
 }
 
 #[test]
@@ -178,10 +218,10 @@ fn arrows_are_extended_scancodes() {
         usage::UP_ARROW,
         usage::DOWN_ARROW,
     ] {
-        let sc = hid_to_scancode(hid).expect("arrow has scancode");
+        let sc = hid_to_windows_scancode(hid).expect("arrow has scancode");
         assert!(
-            is_extended_scancode(sc),
-            "arrow HID {hid:#04X} → scancode {sc:#06X} should be extended"
+            sc.extended,
+            "arrow HID {hid:#04X} → scancode {sc:?} should be extended"
         );
     }
 }
@@ -196,10 +236,10 @@ fn navigation_keys_are_extended_scancodes() {
         usage::END,
         usage::PAGE_DOWN,
     ] {
-        let sc = hid_to_scancode(hid).expect("nav key has scancode");
+        let sc = hid_to_windows_scancode(hid).expect("nav key has scancode");
         assert!(
-            is_extended_scancode(sc),
-            "nav HID {hid:#04X} → scancode {sc:#06X} should be extended"
+            sc.extended,
+            "nav HID {hid:#04X} → scancode {sc:?} should be extended"
         );
     }
 }
@@ -207,17 +247,16 @@ fn navigation_keys_are_extended_scancodes() {
 #[test]
 fn letter_scancodes_are_not_extended() {
     for hid in usage::A..=usage::Z {
-        let sc = hid_to_scancode(hid).expect("letter has scancode");
+        let sc = hid_to_windows_scancode(hid).expect("letter has scancode");
         assert!(
-            !is_extended_scancode(sc),
-            "letter HID {hid:#04X} → scancode {sc:#06X} should not be extended"
+            !sc.extended,
+            "letter HID {hid:#04X} → scancode {sc:?} should not be extended"
         );
     }
 }
 
 #[test]
 fn modifier_classes_have_left_and_right_entries() {
-    // Both tables should reach every modifier HID code.
     let modifiers: &[u16] = &[
         usage::LEFT_CTRL,
         usage::LEFT_SHIFT,
@@ -229,17 +268,14 @@ fn modifier_classes_have_left_and_right_entries() {
         usage::RIGHT_GUI,
     ];
     for hid in modifiers {
-        // hid_to_scancode covers all of them
         assert!(
-            hid_to_scancode(*hid).is_some(),
+            hid_to_windows_scancode(*hid).is_some(),
             "no scancode for modifier HID {hid:#04X}"
         );
-        // The macOS table should produce this HID for some VK
         assert!(
             MACOS_VK_TO_HID.iter().any(|(_, h)| h == hid),
             "MACOS_VK_TO_HID missing modifier HID {hid:#04X}"
         );
-        // Same for the Windows table
         assert!(
             WIN32_VK_TO_HID.iter().any(|(_, h)| h == hid),
             "WIN32_VK_TO_HID missing modifier HID {hid:#04X}"
@@ -249,14 +285,34 @@ fn modifier_classes_have_left_and_right_entries() {
 
 #[test]
 fn every_macos_hid_has_a_scancode() {
-    // Sanity: anything the server can produce from a key tap must be
-    // dispatchable on the Windows side. (The reverse — every scancode-
-    // table HID has a macOS VK — is NOT required, since the table also
-    // covers keys typed via the Mac-as-client future path.)
+    // Anything the server can produce from a key tap must be dispatchable
+    // on the Windows side. The reverse is NOT required — the scancode
+    // table also serves the future Mac-as-client path.
     for (_, hid) in MACOS_VK_TO_HID {
         assert!(
-            hid_to_scancode(*hid).is_some(),
+            hid_to_windows_scancode(*hid).is_some(),
             "MACOS_VK_TO_HID HID 0x{hid:04X} has no scancode entry"
         );
     }
+}
+
+#[test]
+fn modmask_wire_codec_clears_reserved_bits_for_every_byte() {
+    // `from_wire(byte).to_wire()` must equal `byte & 0x0F` for every
+    // possible input — bits 4-7 are reserved and cannot leak through.
+    for byte in 0u8..=255 {
+        let m = ModMask::from_wire(byte);
+        assert_eq!(
+            m.to_wire(),
+            byte & 0x0F,
+            "reserved bits leaked through ModMask round-trip for byte 0x{byte:02X}"
+        );
+    }
+    // Spot-check the well-known masks.
+    assert_eq!(ModMask::from_wire(0b0000_0001), ModMask::SHIFT);
+    assert_eq!(ModMask::from_wire(0b0000_0010), ModMask::CTRL);
+    assert_eq!(ModMask::from_wire(0b0000_0100), ModMask::ALT);
+    assert_eq!(ModMask::from_wire(0b0000_1000), ModMask::META);
+    // Reserved bit 7 set: stripped on the way in.
+    assert_eq!(ModMask::from_wire(0b1000_0001), ModMask::SHIFT);
 }

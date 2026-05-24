@@ -1,17 +1,31 @@
 //! Windows-side HID translation: Win32 VK ↔ HID, HID → PS/2 scancode.
 //!
-//! The client uses [`hid_to_scancode`] with `SendInput` + `KEYEVENTF_SCANCODE`
-//! so injection is keyboard-layout-independent (the wire carries layout-
-//! independent HID codes; the kernel resolves the scancode to whatever
-//! glyph the receiving user has mapped to that physical key).
+//! The client uses [`hid_to_windows_scancode`] with `SendInput` +
+//! `KEYEVENTF_SCANCODE` so injection is keyboard-layout-independent (the
+//! wire carries layout-independent HID codes; the kernel resolves the
+//! scancode to whatever glyph the receiving user has mapped to that
+//! physical key).
 //!
 //! [`windows_to_hid`] is included for symmetry / future Mac-as-client use;
-//! the v1 unidirectional flow only needs `hid_to_scancode`.
+//! the v1 unidirectional flow only needs `hid_to_windows_scancode`.
 //!
-//! **Scancode encoding:** values are PS/2 Set-1 scan codes. Extended keys
-//! (arrows, nav cluster, RCtrl, RAlt, Win) carry the `0xE0` prefix in the
-//! high byte — e.g. `0xE048` = Up arrow. The client splits this into
-//! `wScan = scan & 0xFF` plus `KEYEVENTF_EXTENDEDKEY` iff `scan >> 8 == 0xE0`.
+//! **Scancode encoding:** values in [`HID_TO_SCANCODE`] are PS/2 Set-1
+//! scan codes. Extended keys (arrows, nav cluster, RCtrl, RAlt, both
+//! GUIs) carry the `0xE0` prefix in the high byte — e.g. `0xE048` = Up
+//! arrow. The [`hid_to_windows_scancode`] helper splits this into a
+//! [`WinScancode`] so the platform layer sees `code: 0x48, extended:
+//! true` instead of having to reason about the high-byte convention.
+
+use crate::hid::HidUsage;
+
+/// Result of looking up a HID usage's Win32 scancode. `code` is the value
+/// to put in `KEYBDINPUT.wScan`; `extended` is whether to OR
+/// `KEYEVENTF_EXTENDEDKEY` into `KEYBDINPUT.dwFlags`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WinScancode {
+    pub code: u16,
+    pub extended: bool,
+}
 
 /// `(Win32 VK code, USB HID usage code)` mapping.
 ///
@@ -19,7 +33,7 @@
 /// — the wire is unidirectional Mac→Win — but it's kept here so the future
 /// Mac-as-client path and any keyboard-driven test harness on Windows can
 /// share the same source of truth as the inverse [`HID_TO_SCANCODE`].
-pub const WIN32_VK_TO_HID: &[(u16, u16)] = &[
+pub const WIN32_VK_TO_HID: &[(u16, HidUsage)] = &[
     // ── Letters: VK is ASCII uppercase 0x41..=0x5A ──
     (0x41, 0x04), // A
     (0x42, 0x05), // B
@@ -113,8 +127,9 @@ pub const WIN32_VK_TO_HID: &[(u16, u16)] = &[
 ];
 
 /// `(USB HID usage, PS/2 Set-1 scancode)`. Extended-key scancodes carry
-/// `0xE0` in the high byte; see module-level docs for the split convention.
-pub const HID_TO_SCANCODE: &[(u16, u16)] = &[
+/// `0xE0` in the high byte; [`hid_to_windows_scancode`] splits them into
+/// a [`WinScancode`] for the platform layer.
+pub const HID_TO_SCANCODE: &[(HidUsage, u16)] = &[
     // ── Letters ──
     (0x04, 0x1E), // A
     (0x05, 0x30), // B
@@ -208,34 +223,53 @@ pub const HID_TO_SCANCODE: &[(u16, u16)] = &[
 ];
 
 /// Translate a Win32 VK to its USB HID usage code. `None` for unmapped VKs.
-pub fn windows_to_hid(vk: u16) -> Option<u16> {
+pub fn windows_to_hid(vk: u16) -> Option<HidUsage> {
     WIN32_VK_TO_HID
         .iter()
         .find(|(win_vk, _)| *win_vk == vk)
         .map(|(_, hid)| *hid)
 }
 
-/// Translate a USB HID usage code to its PS/2 Set-1 scancode (with the
-/// `0xE0` extended-key prefix encoded in the high byte where applicable;
-/// see module-level docs).
-pub fn hid_to_scancode(hid: u16) -> Option<u16> {
+/// Translate a USB HID usage code to its PS/2 Set-1 scancode, split into
+/// a [`WinScancode`] so the platform layer can feed `code` straight into
+/// `KEYBDINPUT.wScan` and OR `KEYEVENTF_EXTENDEDKEY` into `dwFlags` iff
+/// `extended` is `true`.
+///
+/// Returns `None` for HID codes outside the v1 supported set.
+pub fn hid_to_windows_scancode(hid: HidUsage) -> Option<WinScancode> {
     HID_TO_SCANCODE
         .iter()
         .find(|(h, _)| *h == hid)
-        .map(|(_, sc)| *sc)
+        .map(|(_, packed)| {
+            let extended = (packed >> 8) == 0xE0;
+            let code = packed & 0x00FF;
+            WinScancode { code, extended }
+        })
 }
 
-/// True iff `scancode` (as returned by [`hid_to_scancode`]) represents an
-/// extended key — i.e. the client should set `KEYEVENTF_EXTENDEDKEY` when
-/// passing it to `SendInput`. Defined here so the convention stays with
-/// the table, not buried in the platform crate.
-pub fn is_extended_scancode(scancode: u16) -> bool {
-    (scancode >> 8) == 0xE0
+/// Translate a HID usage to the packed PS/2 Set-1 scancode (extended-key
+/// prefix in the high byte). Prefer [`hid_to_windows_scancode`] — this
+/// is a thin compat wrapper kept so the in-flight Windows M5 inject path
+/// keeps compiling during the M5 platform-side rollout.
+#[doc(hidden)]
+pub fn hid_to_scancode(hid: HidUsage) -> Option<u16> {
+    HID_TO_SCANCODE
+        .iter()
+        .find(|(h, _)| *h == hid)
+        .map(|(_, packed)| *packed)
 }
 
-/// Extract the low byte of `scancode` for use as `wScan` in a `KEYBDINPUT`.
-/// Trivial helper, included so the platform-side code is grep-able for
-/// the convention.
-pub fn scancode_low_byte(scancode: u16) -> u16 {
-    scancode & 0x00FF
+/// True iff `packed` (as returned by the legacy [`hid_to_scancode`])
+/// represents an extended key. Kept as a compat shim for the Windows M5
+/// inject path; new code should use [`WinScancode::extended`].
+#[doc(hidden)]
+pub fn is_extended_scancode(packed: u16) -> bool {
+    (packed >> 8) == 0xE0
+}
+
+/// Low byte of a packed PS/2 scancode — the `wScan` value for
+/// `KEYBDINPUT`. Compat shim; prefer [`WinScancode::code`].
+#[doc(hidden)]
+pub fn scancode_low_byte(packed: u16) -> u16 {
+    packed & 0x00FF
 }

@@ -1,17 +1,25 @@
-//! macOS virtual keycode → USB HID usage translation.
+//! macOS virtual keycode ↔ USB HID usage translation.
 //!
 //! The macOS VK constants come from `Carbon/HIToolbox/Events.h`
 //! (`kVK_ANSI_*`, `kVK_Return`, etc.). The HID codes come from USB HID
 //! Usage Page 0x07 (Keyboard/Keypad). Both sides are documented inline
 //! so a reviewer can verify each row without flipping between headers.
+//!
+//! Note: `kVK_Delete` (0x33, the main "Delete"/backspace key) maps to
+//! HID 0x2A (Keyboard DELETE/Backspace). The separate "fn delete" key
+//! (`kVK_ForwardDelete` = 0x75) maps to HID 0x4C (Keyboard Delete
+//! Forward) — these two are easy to confuse and the bijection test
+//! pins the distinction.
+
+use crate::hid::HidUsage;
 
 /// `(macOS virtual keycode, USB HID usage code)` mapping, exhaustive for
 /// the v1 supported key set (alphanumeric + common punctuation + arrows +
 /// nav cluster + F1–F12 + modifiers).
 ///
-/// Lookup helper: [`macos_to_hid`]. Direct scans of this slice are also
-/// fine — the bijection test pins ordering invariants.
-pub const MACOS_VK_TO_HID: &[(u16, u16)] = &[
+/// Lookup helpers: [`macos_to_hid`], [`hid_to_macos`]. Direct scans of
+/// this slice are also fine — the bijection test pins ordering invariants.
+pub const MACOS_VK_TO_HID: &[(u16, HidUsage)] = &[
     // ── Letters (kVK_ANSI_A..Z, layout-physical positions) ──
     (0x00, 0x04), // A
     (0x0B, 0x05), // B
@@ -108,9 +116,21 @@ pub const MACOS_VK_TO_HID: &[(u16, u16)] = &[
 /// Returns `None` for keys outside the v1 supported set; callers should
 /// drop the event (and the server's tap will emit a `trace!` so the
 /// missing key is visible during M5 acceptance).
-pub fn macos_to_hid(vk: u16) -> Option<u16> {
+pub fn macos_to_hid(vk: u16) -> Option<HidUsage> {
     MACOS_VK_TO_HID
         .iter()
         .find(|(mac_vk, _)| *mac_vk == vk)
         .map(|(_, hid)| *hid)
+}
+
+/// Reverse lookup: USB HID usage code → macOS virtual keycode.
+///
+/// Reserved for the future Mac-as-client path (the v1 wire is
+/// unidirectional Mac→Win); also used by the bijection test to assert
+/// table consistency.
+pub fn hid_to_macos(hid: HidUsage) -> Option<u16> {
+    MACOS_VK_TO_HID
+        .iter()
+        .find(|(_, h)| *h == hid)
+        .map(|(mac_vk, _)| *mac_vk)
 }
