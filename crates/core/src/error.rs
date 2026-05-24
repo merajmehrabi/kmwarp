@@ -47,56 +47,51 @@ pub enum WireError {
 #[derive(Debug, Error)]
 pub enum StateError {}
 
-/// Errors from the M9 pairing flow + pin-file management.
+/// Errors from `core::tls` — cert generation, pin storage, and the
+/// `PinnedCertVerifier` integration with rustls.
 #[derive(Debug, Error)]
-pub enum PairingError {
-    /// `getrandom` failed during pairing code generation. The wrapped
-    /// string carries the upstream `getrandom::Error` rendering.
-    #[error("RNG failure: {0}")]
-    Rng(String),
-
-    /// The pin file's contents weren't valid hex. Most likely the
-    /// user edited the file; treat as "not paired".
-    #[error("pin file is not valid hex")]
-    PinNotHex,
-
-    /// The pin file decoded to the wrong number of bytes (not 32).
-    #[error("pin file does not decode to 32 bytes")]
-    PinLength,
-
-    /// Filesystem error reading or writing the pin file.
-    #[error("pin file IO error: {0}")]
+pub enum TlsError {
+    /// Filesystem error reading or writing cert/key/pin files.
+    #[error("TLS IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// SPAKE2 protocol error. The library's failure types are opaque
-    /// so we can only signal "didn't complete cleanly".
-    #[error("SPAKE2 key derivation failed")]
-    Spake2,
+    /// `rcgen` cert generation failed.
+    #[error("cert generation failed: {0}")]
+    Rcgen(#[from] rcgen::Error),
 
-    /// `hmac::Hmac::new_from_slice` failed (extremely unlikely; only
-    /// happens for an empty key with some backends).
-    #[error("invalid HMAC key")]
-    HmacKey,
+    /// On-disk cert/key bytes didn't parse.
+    #[error("on-disk cert/key has bad format: {0}")]
+    BadCertFormat(String),
 
-    /// Tag verification failed — the frame was tampered with, the
-    /// peer used a different key, or the pairing code was wrong.
-    #[error("HMAC verification failed")]
-    HmacMismatch,
+    /// Pin file contents were not what we expected.
+    #[error("pin file corrupt: {0}")]
+    PinFileCorrupt(String),
 
-    /// A peer cert DER blob exceeded the `u16` length field of the
-    /// auth frame. We cap at 65535 bytes.
-    #[error("cert too long for auth frame: {0} bytes (max 65535)")]
-    CertTooLong(usize),
+    /// Rustls library error.
+    #[error("rustls error: {0}")]
+    Rustls(#[from] rustls::Error),
+}
 
-    /// The received auth frame is too short to contain even a header
-    /// + HMAC tag.
-    #[error("auth frame shorter than header + HMAC")]
-    AuthFrameTooShort,
+/// Errors from `core::pairing` — SPAKE2 handshake + cert HMAC.
+#[derive(Debug, Error)]
+pub enum PairingError {
+    /// SPAKE2 protocol failure.
+    #[error("SPAKE2 protocol failed")]
+    Spake,
 
-    /// The auth frame's claimed cert length doesn't match its actual
-    /// byte count.
-    #[error("auth frame length mismatch")]
-    AuthFrameLen,
+    /// HMAC over the peer's cert DER didn't match the expected tag.
+    /// The M9 fail-shut path: wrong pairing code → different derived
+    /// keys → HMAC mismatch → reject.
+    #[error("HMAC verification of peer cert failed")]
+    HmacVerifyFailed,
+
+    /// Pairing code is not exactly 6 decimal digits.
+    #[error("pairing code must be exactly 6 decimal digits")]
+    CodeMustBe6Digits,
+
+    /// `getrandom` failure during `generate_code`.
+    #[error("RNG failure: {0}")]
+    Rng(String),
 }
 
 /// Errors from `~/.config/kmwarp/config.toml` parsing and loading.

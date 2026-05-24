@@ -13,10 +13,11 @@ pub mod modmap;
 pub mod pairing;
 pub mod platform;
 pub mod stuck_keys;
+pub mod tls;
 pub mod wire;
 
 pub use clipboard::{ChunkFlags, Chunker, EchoGuard, ReassembleError, Reassembler};
-pub use error::{ConfigError, PairingError, StateError, WireError};
+pub use error::{ConfigError, PairingError, StateError, TlsError, WireError};
 pub use platform::{
     Clipboard, ClipboardEvent, InputSink, InputSource, KeyState, ModMask, MouseButton, SourceEvent,
 };
