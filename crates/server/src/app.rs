@@ -51,6 +51,19 @@
 //!    Windows side as part of the `on_release_control` drain; nothing
 //!    sticks.
 //!
+//! ## M8 acceptance test (manual, real hardware)
+//!
+//! 1. With server + client running and connected:
+//!    Copy "hello clipboard" on the Mac (`Cmd+C` after selecting). Within
+//!    ~500 ms, paste on Windows Notepad — text appears.
+//! 2. Copy "world from win" on Windows. Within ~500 ms, paste on Mac
+//!    (`Cmd+V`) — text appears.
+//! 3. Verify no echo loop: repeat the Mac copy and confirm Windows shows
+//!    the text only once (the SHA-256 `EchoGuard` suppresses the
+//!    post-write watcher tick).
+//! 4. Copy a long string (> 4 KiB) on the Mac — chunked frames assemble
+//!    cleanly on the Windows side without truncation.
+//!
 //! ## CGEventTap ownership
 //!
 //! [`MacInputSource::install`] is called per accepted peer. v1 is
