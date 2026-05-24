@@ -628,6 +628,10 @@ async fn edge_brain_task(
     };
     let mut sm = StateMachine::new(cfg);
     let mut sink = crate::platform::macos::inject::MacInputSink::new();
+    // M7 modifier remap. v1.0 of M7 wires `ModRemap::default()`
+    // (Cmd→Ctrl, Option→Alt); the M7 follow-up commit swaps in the
+    // value loaded from `~/.config/kmwarp/config.toml`.
+    let mod_remap = kmwarp_core::modmap::ModRemap::default();
 
     let epoch = Instant::now();
     debug!(peer = %remote, screen_w_px, "edge_brain online (LocalActive)");
@@ -644,7 +648,7 @@ async fn edge_brain_task(
             }
         };
         for action in actions {
-            execute_action(remote, action, &mut sink, &tx_out, &swallow);
+            execute_action(remote, action, &mut sink, &tx_out, &swallow, &mod_remap);
         }
     }
     TaskExit::EdgeBrainFailed("brain input channel closed".into())
@@ -654,6 +658,13 @@ async fn edge_brain_task(
 /// `tx_out.try_send` (warn-and-drop on full, same backpressure rule as
 /// the rest of the M4 pump). Cursor-control actions are direct CG calls
 /// on the sink. Swallow flips a single atomic.
+///
+/// Every `SendMessage(KeyEvent)` is run through [`remap_key_message`]
+/// before enqueue: the modifier byte goes through `ModRemap::apply`,
+/// and the modifier-key HID itself is rewritten via
+/// [`remap_modifier_hid`] so e.g. a Cmd keypress (HID 0xE3 LeftGUI)
+/// arrives on the wire as LeftCtrl (HID 0xE0) under the default
+/// Cmd→Ctrl mapping. Non-key messages pass through unchanged.
 #[cfg(target_os = "macos")]
 fn execute_action(
     remote: SocketAddr,
@@ -661,6 +672,7 @@ fn execute_action(
     sink: &mut crate::platform::macos::inject::MacInputSink,
     tx_out: &mpsc::Sender<Message>,
     swallow: &std::sync::Arc<AtomicBool>,
+    mod_remap: &kmwarp_core::modmap::ModRemap,
 ) {
     use kmwarp_core::edge::Action;
     use kmwarp_core::platform::InputSink;
@@ -673,7 +685,9 @@ fn execute_action(
         Action::SendReleaseControl { exit_y } => {
             enqueue(remote, tx_out, Message::ReleaseControl { exit_y })
         }
-        Action::SendMessage(msg) => enqueue(remote, tx_out, msg),
+        Action::SendMessage(msg) => {
+            enqueue(remote, tx_out, remap_key_message(msg, mod_remap));
+        }
         Action::WarpLocalCursor { x, y } => sink.warp_cursor_abs(x, y),
         Action::HideLocalCursor => sink.hide_cursor(),
         Action::ShowLocalCursor => sink.show_cursor(),
@@ -685,6 +699,35 @@ fn execute_action(
             debug!(peer = %remote, "brain: StopSwallow (LocalActive)");
             swallow.store(false, Ordering::Relaxed);
         }
+    }
+}
+
+/// Apply the configured [`ModRemap`] to a `Message::KeyEvent` (both the
+/// modifier byte and, if the event itself is a modifier key, the HID
+/// code). Other message variants pass through unchanged.
+///
+/// **Why both layers.** Without HID remap the Cmd KEY itself goes to
+/// the Windows side as LeftGUI (the Win key), so even though the
+/// modifier byte on the C event correctly says "Ctrl", the Win key is
+/// physically held — the user gets Win+C, not Ctrl+C.
+/// `ModRemap::apply_to_hid` + `ModRemap::apply_to_modmask` together
+/// fix both layers.
+#[cfg(target_os = "macos")]
+fn remap_key_message(msg: Message, remap: &kmwarp_core::modmap::ModRemap) -> Message {
+    use kmwarp_core::platform::ModMask;
+    match msg {
+        Message::KeyEvent {
+            hid_usage,
+            state,
+            modifiers,
+        } => Message::KeyEvent {
+            hid_usage: remap.apply_to_hid(hid_usage),
+            state,
+            modifiers: remap
+                .apply_to_modmask(ModMask::from_wire(modifiers))
+                .to_wire(),
+        },
+        other => other,
     }
 }
 
@@ -786,5 +829,133 @@ async fn latency_prober(
                 return TaskExit::LatencyProberFailed("outbound channel closed".into())
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use kmwarp_core::hid::usage;
+    use kmwarp_core::modmap::{ModRemap, ModTarget};
+    use kmwarp_core::platform::ModMask;
+    use kmwarp_core::wire::key_state_code;
+
+    #[test]
+    fn remap_key_message_cmd_c_to_ctrl_c() {
+        let r = ModRemap::default();
+        let msg = Message::KeyEvent {
+            hid_usage: usage::C,
+            state: key_state_code::DOWN,
+            modifiers: ModMask::META.to_wire(),
+        };
+        let out = remap_key_message(msg, &r);
+        match out {
+            Message::KeyEvent {
+                hid_usage,
+                state,
+                modifiers,
+            } => {
+                // HID for 'C' is unchanged (not a modifier key).
+                assert_eq!(hid_usage, usage::C);
+                assert_eq!(state, key_state_code::DOWN);
+                // Modifier byte: META bit cleared, CTRL bit set.
+                assert_eq!(modifiers, ModMask::CTRL.to_wire());
+            }
+            other => panic!("expected KeyEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remap_key_message_cmd_keypress_itself_becomes_lctrl() {
+        let r = ModRemap::default();
+        // User physically presses Cmd: FlagsChanged → SourceEvent::Key
+        // { hid: LeftGUI, mods: META }. SM forwards as KeyEvent. We
+        // remap to LeftCtrl on the wire so Windows actually sees Ctrl.
+        let msg = Message::KeyEvent {
+            hid_usage: usage::LEFT_GUI,
+            state: key_state_code::DOWN,
+            modifiers: ModMask::META.to_wire(),
+        };
+        let out = remap_key_message(msg, &r);
+        match out {
+            Message::KeyEvent {
+                hid_usage,
+                modifiers,
+                ..
+            } => {
+                assert_eq!(hid_usage, usage::LEFT_CTRL);
+                assert_eq!(modifiers, ModMask::CTRL.to_wire());
+            }
+            other => panic!("expected KeyEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remap_key_message_right_cmd_to_right_ctrl() {
+        let r = ModRemap::default();
+        let msg = Message::KeyEvent {
+            hid_usage: usage::RIGHT_GUI,
+            state: key_state_code::UP,
+            modifiers: 0,
+        };
+        let out = remap_key_message(msg, &r);
+        if let Message::KeyEvent { hid_usage, .. } = out {
+            assert_eq!(hid_usage, usage::RIGHT_CTRL);
+        } else {
+            panic!("expected KeyEvent");
+        }
+    }
+
+    #[test]
+    fn remap_key_message_passes_through_non_modifier_hid() {
+        let r = ModRemap::default();
+        for hid in [usage::A, usage::Z, usage::D1, usage::SPACE, usage::F1] {
+            let msg = Message::KeyEvent {
+                hid_usage: hid,
+                state: key_state_code::DOWN,
+                modifiers: 0,
+            };
+            let out = remap_key_message(msg, &r);
+            if let Message::KeyEvent { hid_usage, .. } = out {
+                assert_eq!(hid_usage, hid);
+            } else {
+                panic!("expected KeyEvent");
+            }
+        }
+    }
+
+    #[test]
+    fn remap_key_message_swap_cmd_to_alt_via_custom() {
+        let r = ModRemap {
+            cmd: ModTarget::Alt,
+            option: ModTarget::Ctrl,
+        };
+        let msg = Message::KeyEvent {
+            hid_usage: usage::LEFT_GUI,
+            state: key_state_code::DOWN,
+            modifiers: ModMask::META.to_wire(),
+        };
+        let out = remap_key_message(msg, &r);
+        if let Message::KeyEvent {
+            hid_usage,
+            modifiers,
+            ..
+        } = out
+        {
+            assert_eq!(hid_usage, usage::LEFT_ALT);
+            assert_eq!(modifiers, ModMask::ALT.to_wire());
+        } else {
+            panic!("expected KeyEvent");
+        }
+    }
+
+    #[test]
+    fn remap_key_message_passes_through_non_key_variants() {
+        let r = ModRemap::default();
+        let mouse = Message::MouseMoveRel { dx: 3, dy: -4 };
+        assert_eq!(remap_key_message(mouse.clone(), &r), mouse);
+
+        let hb = Message::Heartbeat { seq: 17 };
+        assert_eq!(remap_key_message(hb.clone(), &r), hb);
     }
 }
