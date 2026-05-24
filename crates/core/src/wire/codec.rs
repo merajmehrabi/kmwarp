@@ -165,6 +165,59 @@ pub fn encode_frame(msg: &Message, buf: &mut BytesMut) -> Result<(), WireError> 
             buf.put_u64_le(*ts_ns);
             tracing::trace!(ts_ns, "encoded EchoPong");
         }
+        Message::PairSpakeA { msg } => {
+            let _span = tracing::trace_span!("msg.PairSpakeA").entered();
+            let payload_len = check_payload_len(2usize.saturating_add(msg.len()))?;
+            let msg_len = u16::try_from(msg.len()).map_err(|_| too_long(msg.len()))?;
+            buf.reserve(FRAME_HEADER_LEN + payload_len as usize);
+            buf.put_u8(msg_type::PAIR_SPAKE_A);
+            buf.put_u16_le(payload_len);
+            buf.put_u16_le(msg_len);
+            buf.put_slice(msg);
+            tracing::trace!(msg_len, "encoded PairSpakeA");
+        }
+        Message::PairSpakeB { msg } => {
+            let _span = tracing::trace_span!("msg.PairSpakeB").entered();
+            let payload_len = check_payload_len(2usize.saturating_add(msg.len()))?;
+            let msg_len = u16::try_from(msg.len()).map_err(|_| too_long(msg.len()))?;
+            buf.reserve(FRAME_HEADER_LEN + payload_len as usize);
+            buf.put_u8(msg_type::PAIR_SPAKE_B);
+            buf.put_u16_le(payload_len);
+            buf.put_u16_le(msg_len);
+            buf.put_slice(msg);
+            tracing::trace!(msg_len, "encoded PairSpakeB");
+        }
+        Message::PairCertExchange { cert_der, hmac } => {
+            let _span = tracing::trace_span!("msg.PairCertExchange").entered();
+            // cert_len(2) + cert + hmac(32)
+            let payload_len =
+                check_payload_len(2usize.saturating_add(cert_der.len()).saturating_add(32))?;
+            let cert_len = u16::try_from(cert_der.len()).map_err(|_| too_long(cert_der.len()))?;
+            buf.reserve(FRAME_HEADER_LEN + payload_len as usize);
+            buf.put_u8(msg_type::PAIR_CERT_EXCHANGE);
+            buf.put_u16_le(payload_len);
+            buf.put_u16_le(cert_len);
+            buf.put_slice(cert_der);
+            buf.put_slice(hmac);
+            tracing::trace!(cert_len, "encoded PairCertExchange");
+        }
+        Message::PairAccepted => {
+            let _span = tracing::trace_span!("msg.PairAccepted").entered();
+            let payload_len: u16 = 0;
+            buf.reserve(FRAME_HEADER_LEN);
+            buf.put_u8(msg_type::PAIR_ACCEPTED);
+            buf.put_u16_le(payload_len);
+            tracing::trace!("encoded PairAccepted");
+        }
+        Message::PairRejected { reason_code } => {
+            let _span = tracing::trace_span!("msg.PairRejected").entered();
+            let payload_len: u16 = 1;
+            buf.reserve(FRAME_HEADER_LEN + payload_len as usize);
+            buf.put_u8(msg_type::PAIR_REJECTED);
+            buf.put_u16_le(payload_len);
+            buf.put_u8(*reason_code);
+            tracing::trace!(reason_code, "encoded PairRejected");
+        }
     }
     Ok(())
 }
@@ -310,6 +363,41 @@ fn decode_payload(msg_type_byte: u8, payload: &[u8]) -> Result<Message, WireErro
             let ts_ns = r.read_u64_le()?;
             tracing::trace!(ts_ns, "decoded EchoPong");
             Ok(Message::EchoPong { ts_ns })
+        }
+        msg_type::PAIR_SPAKE_A => {
+            let _span = tracing::trace_span!("msg.PairSpakeA").entered();
+            let msg_len = r.read_u16_le()? as usize;
+            let msg_bytes = r.read_bytes(msg_len)?.to_vec();
+            tracing::trace!(msg_len, "decoded PairSpakeA");
+            Ok(Message::PairSpakeA { msg: msg_bytes })
+        }
+        msg_type::PAIR_SPAKE_B => {
+            let _span = tracing::trace_span!("msg.PairSpakeB").entered();
+            let msg_len = r.read_u16_le()? as usize;
+            let msg_bytes = r.read_bytes(msg_len)?.to_vec();
+            tracing::trace!(msg_len, "decoded PairSpakeB");
+            Ok(Message::PairSpakeB { msg: msg_bytes })
+        }
+        msg_type::PAIR_CERT_EXCHANGE => {
+            let _span = tracing::trace_span!("msg.PairCertExchange").entered();
+            let cert_len = r.read_u16_le()? as usize;
+            let cert_der = r.read_bytes(cert_len)?.to_vec();
+            let hmac_bytes = r.read_bytes(32)?;
+            let mut hmac = [0u8; 32];
+            hmac.copy_from_slice(hmac_bytes);
+            tracing::trace!(cert_len, "decoded PairCertExchange");
+            Ok(Message::PairCertExchange { cert_der, hmac })
+        }
+        msg_type::PAIR_ACCEPTED => {
+            let _span = tracing::trace_span!("msg.PairAccepted").entered();
+            tracing::trace!("decoded PairAccepted");
+            Ok(Message::PairAccepted)
+        }
+        msg_type::PAIR_REJECTED => {
+            let _span = tracing::trace_span!("msg.PairRejected").entered();
+            let reason_code = r.read_u8()?;
+            tracing::trace!(reason_code, "decoded PairRejected");
+            Ok(Message::PairRejected { reason_code })
         }
         unknown => Err(WireError::UnknownMsgType(unknown)),
     }

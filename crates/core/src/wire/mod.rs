@@ -47,6 +47,16 @@ pub mod msg_type {
     pub const CLIPBOARD_TEXT: u8 = 0x30;
     pub const TAKE_CONTROL: u8 = 0x40;
     pub const RELEASE_CONTROL: u8 = 0x41;
+
+    // M9 pairing: runs over the unencrypted TCP socket before TLS,
+    // because the client doesn't have a pinned cert until pairing
+    // completes. msg_type bytes 0x50..=0x54.
+    pub const PAIR_SPAKE_A: u8 = 0x50;
+    pub const PAIR_SPAKE_B: u8 = 0x51;
+    pub const PAIR_CERT_EXCHANGE: u8 = 0x52;
+    pub const PAIR_ACCEPTED: u8 = 0x53;
+    pub const PAIR_REJECTED: u8 = 0x54;
+
     pub const ECHO_PING: u8 = 0x70;
     pub const ECHO_PONG: u8 = 0x71;
     pub const HEARTBEAT: u8 = 0xFE;
@@ -134,4 +144,27 @@ pub enum Message {
     /// Reply to `EchoPing`. `ts_ns` is verbatim from the matching ping; the
     /// prober subtracts it from its current clock reading to compute RTT.
     EchoPong { ts_ns: u64 },
+
+    /// M9 pairing element A (server → client). Opaque SPAKE2 element
+    /// bytes; the receiver feeds them to `core::pairing::ClientPairing::finish`.
+    PairSpakeA { msg: Vec<u8> },
+
+    /// M9 pairing element B (client → server). Opaque SPAKE2 element
+    /// bytes; the receiver feeds them to `core::pairing::ServerPairing::finish`.
+    PairSpakeB { msg: Vec<u8> },
+
+    /// M9 cert exchange: peer's X.509 DER + `HMAC-SHA256(K, cert_der)`
+    /// where `K` is the SPAKE2-derived shared key. The receiver
+    /// verifies the HMAC, then pins `SHA-256(cert_der)`.
+    PairCertExchange { cert_der: Vec<u8>, hmac: [u8; 32] },
+
+    /// M9 pairing accepted by sender. Sent after a successful cert-
+    /// HMAC verify; the connection is then upgraded to TLS using the
+    /// just-pinned cert.
+    PairAccepted,
+
+    /// M9 pairing rejected. `reason_code` is freeform; v1 uses:
+    /// 1 = SPAKE2 protocol failure, 2 = HMAC verify failure,
+    /// 3 = user cancelled, 4 = code expired/mistyped.
+    PairRejected { reason_code: u8 },
 }

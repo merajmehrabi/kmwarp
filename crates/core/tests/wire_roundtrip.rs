@@ -80,6 +80,25 @@ fn all_variants() -> Vec<Message> {
         Message::EchoPong {
             ts_ns: 1_234_567_890,
         },
+        // M9 pairing
+        Message::PairSpakeA { msg: vec![] },
+        Message::PairSpakeA {
+            msg: vec![0x11; 33], // Ed25519Group element is ~33 bytes
+        },
+        Message::PairSpakeB {
+            msg: vec![0x22; 33],
+        },
+        Message::PairCertExchange {
+            cert_der: vec![0x30; 256],
+            hmac: [0xAB; 32],
+        },
+        Message::PairCertExchange {
+            cert_der: Vec::new(),
+            hmac: [0; 32],
+        },
+        Message::PairAccepted,
+        Message::PairRejected { reason_code: 0 },
+        Message::PairRejected { reason_code: 4 },
     ]
 }
 
