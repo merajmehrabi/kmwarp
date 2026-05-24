@@ -4,5 +4,7 @@
 //! eventually share the same `core::wire` codec — only error types differ.
 
 pub mod connection;
+pub mod pump;
 
 pub use connection::{Connection, FrameReader, FrameWriter};
+pub use pump::{encoder_loop, injector_loop};

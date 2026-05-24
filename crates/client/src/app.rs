@@ -1,20 +1,33 @@
-//! Top-level client runtime: connect-with-backoff + per-session handshake /
-//! heartbeat / reader / deadline-watcher.
+//! Top-level client runtime.
 //!
-//! M1 lifecycle:
+//! ## Lifecycle
 //!
-//! 1. Loop: attempt `TcpStream::connect(connect)`. Failures back off
-//!    exponentially from 250 ms up to 5 s.
-//! 2. On success, wrap in [`Connection`], send `Hello { proto_version,
-//!    peer_name }`, await `HelloAck`. If `!accepted`, bail with
-//!    [`ClientError::HandshakeRejected`].
-//! 3. Spawn the same three-task structure as the server (writer / reader /
-//!    deadline watcher) via a [`JoinSet`]; first exit aborts the rest.
-//! 4. After the session ends (peer dead, socket dropped, deadline expired),
-//!    log it and return to the connect loop. Reconnect polish is M10's job
-//!    but a tiny loop here keeps the dev experience sane and matches the
-//!    acceptance test's "restart terminal A → terminal B should reconnect"
-//!    flow.
+//! 1. Connect to the server (exponential backoff 250 ms → 5 s, capped).
+//! 2. Send `Hello`, await `HelloAck`. A hard refusal
+//!    (`HelloAck { accepted: false }`) aborts the binary; any other error
+//!    just kicks us back to the connect loop.
+//! 3. Build a real [`InputSink`] (`WinInputSink` on Windows,
+//!    [`crate::sink::NoOpSink`] elsewhere — so the pipe is still
+//!    exercisable on the macOS dev host).
+//! 4. Spawn the M4 task graph:
+//!
+//! ```text
+//!  ┌──────────────────────────┐   tx_out (mpsc 256, bounded)
+//!  │ heartbeat_producer       │ ────────────┐
+//!  └──────────────────────────┘             │
+//!  ┌──────────────────────────┐             ▼
+//!  │ injector_loop            │       ┌───────────────┐
+//!  │  read_frame + dispatch   │ ────► │ encoder_loop  │ ──► socket
+//!  │  EchoPing → EchoPong     │       └───────────────┘
+//!  │  Mouse* → sink           │
+//!  └──────────────────────────┘
+//!         │
+//!         └─ notify ─► deadline_watcher (2 s)
+//! ```
+//!
+//! First task exit aborts the rest. On normal disconnect (peer dead,
+//! deadline expired) we loop back to step 1; on a hard handshake refusal
+//! we propagate `Err`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,13 +35,14 @@ use std::time::Duration;
 
 use kmwarp_core::wire::{Message, PROTO_VERSION};
 use tokio::net::TcpStream;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinSet;
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::error::ClientError;
-use crate::net::{Connection, FrameReader, FrameWriter};
+use crate::net::{encoder_loop, injector_loop, Connection, FrameReader, FrameWriter};
+use crate::sink::{build_default_sink, DefaultSink};
 
 /// Heartbeat cadence; spec §M1 mandates 500 ms.
 const HEARTBEAT_PERIOD: Duration = Duration::from_millis(500);
@@ -42,25 +56,20 @@ const BACKOFF_INITIAL: Duration = Duration::from_millis(250);
 /// Maximum reconnect delay; capped per spec gotcha ("250 ms → 5 s, capped").
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
+/// Outbound channel bound; matches the server. Encoder is the natural
+/// backpressure point per PLAN.md §Async channel topology.
+const OUTBOUND_CHANNEL_BOUND: usize = 256;
+
 /// Run the client forever: connect, run a session, reconnect on loss.
 ///
-/// Returns `Err` only on a programmer-level fault (the connect / session
-/// loops handle expected disconnects internally). For now it is `!`-shaped
-/// in practice — the only exit is the `run_session` returning, after which
-/// we reconnect.
+/// Returns `Err` only on a hard handshake refusal — every other failure
+/// mode (connect refused, socket dropped, peer silence) is recoverable
+/// via reconnect.
 pub async fn run_client(connect: SocketAddr, peer_name: &str) -> anyhow::Result<()> {
     let peer_name_arc: Arc<str> = Arc::from(peer_name);
 
     loop {
-        let stream = match connect_with_backoff(connect).await {
-            Ok(s) => s,
-            Err(e) => {
-                // `connect_with_backoff` never returns Err in M1 (it loops),
-                // but the type permits it for future bail-out conditions.
-                error!(error = %e, "client connect aborted");
-                return Err(e.into());
-            }
-        };
+        let stream = connect_with_backoff(connect).await;
         info!(addr = %connect, "connected to kmwarp-server at {connect}");
 
         match run_one_session(connect, stream, &peer_name_arc).await {
@@ -75,14 +84,14 @@ pub async fn run_client(connect: SocketAddr, peer_name: &str) -> anyhow::Result<
 }
 
 /// Connect to `addr`, retrying with exponential backoff (250 ms → 5 s).
-/// Returns once a connection is established.
-async fn connect_with_backoff(addr: SocketAddr) -> Result<TcpStream, ClientError> {
+/// Returns once a connection is established. Infinite loop on failures.
+async fn connect_with_backoff(addr: SocketAddr) -> TcpStream {
     let mut delay = BACKOFF_INITIAL;
     let mut attempt: u32 = 1;
     loop {
         debug!(addr = %addr, attempt, "attempting connect");
         match TcpStream::connect(addr).await {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => return stream,
             Err(e) => {
                 warn!(
                     addr = %addr,
@@ -99,9 +108,9 @@ async fn connect_with_backoff(addr: SocketAddr) -> Result<TcpStream, ClientError
     }
 }
 
-/// Handshake then run the three-task session. Returns `Ok(())` on a normal
-/// disconnect (peer went silent / clean teardown); returns `Err` for a hard
-/// rejection or protocol fault that callers should treat distinctly.
+/// Handshake then run the M4 task graph. Returns `Ok(())` on a normal
+/// disconnect; `Err` on a hard handshake refusal or protocol fault that
+/// callers should distinguish.
 async fn run_one_session(
     addr: SocketAddr,
     stream: TcpStream,
@@ -109,7 +118,6 @@ async fn run_one_session(
 ) -> Result<(), ClientError> {
     let mut conn = Connection::new(stream)?;
 
-    // Handshake: send Hello, expect HelloAck.
     conn.write_frame(&Message::Hello {
         proto_version: PROTO_VERSION,
         peer_name: peer_name.to_string(),
@@ -137,21 +145,47 @@ async fn run_one_session(
         }
     }
 
+    // Construct sink AFTER handshake so a sink-init failure doesn't keep
+    // a connected socket hanging while the user diagnoses DPI awareness.
+    let sink: DefaultSink = match build_default_sink() {
+        Ok(s) => s,
+        Err(e) => {
+            error!(addr = %addr, error = %e, "failed to build input sink; ending session");
+            return Ok(());
+        }
+    };
+
     let (reader, writer) = conn.into_split();
-    run_session_tasks(addr, reader, writer).await;
+    run_session_tasks(addr, reader, writer, sink).await;
     Ok(())
 }
 
-/// Run the three-task heartbeat / reader / watcher loop. Returns when any of
-/// them exits. Sibling tasks are aborted before this returns so logs land in
-/// a coherent order.
-async fn run_session_tasks(addr: SocketAddr, reader: FrameReader, writer: FrameWriter) {
+/// Spawn the four-task session graph and wait for the first exit.
+async fn run_session_tasks(
+    addr: SocketAddr,
+    reader: FrameReader,
+    writer: FrameWriter,
+    sink: DefaultSink,
+) {
+    let (tx_out, rx_out) = mpsc::channel::<Message>(OUTBOUND_CHANNEL_BOUND);
     let notify = Arc::new(Notify::new());
 
     let mut set: JoinSet<TaskExit> = JoinSet::new();
-    set.spawn(writer_task(addr, writer));
-    set.spawn(reader_task(addr, reader, Arc::clone(&notify)));
+
+    set.spawn(spawn_encoder(rx_out, writer));
+    set.spawn(heartbeat_producer(addr, tx_out.clone()));
+    set.spawn(spawn_injector(
+        addr,
+        reader,
+        sink,
+        Arc::clone(&notify),
+        tx_out.clone(),
+    ));
     set.spawn(deadline_watcher(addr, notify));
+
+    // Drop the original sender so the channel closes once every task-held
+    // clone is dropped (clean shutdown drain).
+    drop(tx_out);
 
     if let Some(joined) = set.join_next().await {
         let exit = joined.unwrap_or(TaskExit::JoinError);
@@ -167,51 +201,74 @@ async fn run_session_tasks(addr: SocketAddr, reader: FrameReader, writer: FrameW
     }
 }
 
-/// Discriminant for which sub-task exited and why.
+/// Wrap the encoder so it surfaces a [`TaskExit`] discriminant.
+async fn spawn_encoder(rx: mpsc::Receiver<Message>, writer: FrameWriter) -> TaskExit {
+    match encoder_loop(rx, writer).await {
+        Ok(()) => TaskExit::EncoderClosed,
+        Err(e) => TaskExit::EncoderFailed(e.to_string()),
+    }
+}
+
+/// Wrap the injector so it surfaces a [`TaskExit`] discriminant.
+async fn spawn_injector(
+    _addr: SocketAddr,
+    reader: FrameReader,
+    sink: DefaultSink,
+    notify: Arc<Notify>,
+    tx_out: mpsc::Sender<Message>,
+) -> TaskExit {
+    match injector_loop(reader, sink, notify, tx_out).await {
+        Ok(()) => TaskExit::PeerByeOrClose,
+        Err(e) => TaskExit::ReaderFailed(e.to_string()),
+    }
+}
+
 #[derive(Debug)]
 enum TaskExit {
-    WriterFailed(String),
+    EncoderFailed(String),
+    EncoderClosed,
+    HeartbeatFailed(String),
     ReaderFailed(String),
+    PeerByeOrClose,
     DeadlineExpired,
     JoinError,
 }
 
 fn log_exit(addr: SocketAddr, exit: TaskExit) {
     match exit {
-        TaskExit::WriterFailed(reason) => {
-            warn!(addr = %addr, reason, "writer task failed; tearing down")
+        TaskExit::EncoderFailed(reason) => {
+            warn!(addr = %addr, reason, "encoder failed; tearing down")
+        }
+        TaskExit::EncoderClosed => debug!(addr = %addr, "encoder channel closed; tearing down"),
+        TaskExit::HeartbeatFailed(reason) => {
+            warn!(addr = %addr, reason, "heartbeat producer failed; tearing down")
         }
         TaskExit::ReaderFailed(reason) => {
-            warn!(addr = %addr, reason, "reader task failed; tearing down")
+            warn!(addr = %addr, reason, "injector failed; tearing down")
         }
+        TaskExit::PeerByeOrClose => info!(addr = %addr, "peer sent Bye; ending session"),
         TaskExit::DeadlineExpired => debug!(addr = %addr, "deadline watcher fired"),
         TaskExit::JoinError => warn!(addr = %addr, "task join error"),
     }
 }
 
-async fn writer_task(addr: SocketAddr, mut writer: FrameWriter) -> TaskExit {
+async fn heartbeat_producer(addr: SocketAddr, tx: mpsc::Sender<Message>) -> TaskExit {
     let mut ticker = interval(HEARTBEAT_PERIOD);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut seq: u32 = 0;
     loop {
         ticker.tick().await;
-        if let Err(e) = writer.write_frame(&Message::Heartbeat { seq }).await {
-            return TaskExit::WriterFailed(e.to_string());
-        }
-        debug!(addr = %addr, seq, "sent Heartbeat");
-        seq = seq.wrapping_add(1);
-    }
-}
-
-async fn reader_task(addr: SocketAddr, mut reader: FrameReader, notify: Arc<Notify>) -> TaskExit {
-    loop {
-        match reader.read_frame().await {
-            Ok(msg) => {
-                debug!(addr = %addr, ?msg, "received frame");
-                notify.notify_one();
+        let msg = Message::Heartbeat { seq };
+        match tx.try_send(msg) {
+            Ok(()) => trace!(addr = %addr, seq, "queued Heartbeat"),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(addr = %addr, seq, "outbound full; dropping Heartbeat")
             }
-            Err(e) => return TaskExit::ReaderFailed(e.to_string()),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return TaskExit::HeartbeatFailed("outbound channel closed".into())
+            }
         }
+        seq = seq.wrapping_add(1);
     }
 }
 
