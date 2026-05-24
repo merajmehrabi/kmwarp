@@ -7,13 +7,14 @@
 //! [`MacInputSource::install`] we:
 //!
 //! 1. Spawn a dedicated `std::thread` (`kmwarp-cgtap`).
-//! 2. Inside it, create the tap, attach its mach port to the thread-local
+//! 2. Inside it, create the tap via raw `CGEventTapCreate` FFI (see
+//!    "Raw FFI" below), attach its mach port to the thread-local
 //!    `CFRunLoop`, enable it, and call `CFRunLoop::run_current` (blocks).
 //! 3. Publish the run-loop handle back to the installer via a
 //!    `std::sync::mpsc` channel.
 //! 4. Spawn a tiny watcher thread (`kmwarp-cgtap-shutdown`) that blocks on
 //!    a `std::sync::mpsc::Receiver`. When the matching `Sender` (stored in
-//!    `MacInputSource::_shutdown`) drops, the watcher wakes and calls
+//!    `MacInputSource::shutdown`) drops, the watcher wakes and calls
 //!    `CFRunLoop::stop` — which is documented thread-safe — and the tap
 //!    thread exits its `run_current` and the thread terminates.
 //!
@@ -21,31 +22,45 @@
 //! source can be torn down during runtime shutdown when tokio tasks may no
 //! longer be schedulable.
 //!
-//! ## Callback contract
+//! ## Raw FFI (and why we dropped the `core-graphics` safe wrapper)
 //!
-//! The callback is `Fn(&CGEvent) -> Option<CGEvent>`. M2 returns `None`
-//! unconditionally, which the `core-graphics` wrapper interprets as
-//! "pass the original event through" (no swallowing). M6 will revisit when
-//! the edge state machine wants to consume events while remote-active.
+//! M2 used `core_graphics::event::CGEventTap`, whose internal callback
+//! interprets a closure return of `None` as "pass through the original
+//! event unchanged" — there's no way to actually return `NULL` and have
+//! the OS swallow the event. M6's `RemoteActive` state requires
+//! swallowing (the user is controlling the Windows peer; the Mac must
+//! not also see those mouse moves and keystrokes), so we install the
+//! tap directly via `CGEventTapCreate` and own the `extern "C"`
+//! callback ourselves. The same `CFMachPort` returned by `CGEventTapCreate`
+//! is then wrapped via `TCFType::wrap_under_create_rule` for run-loop
+//! attachment.
 //!
-//! Tap-disabled handling (timeout / user-input) re-enables the tap from
-//! inside the callback via `CGEventTapEnable` on the captured mach-port
-//! pointer (published through an `OnceLock<usize>` shared with the outer
-//! thread).
+//! ## Swallow semantics
+//!
+//! The callback always *translates* the event and sends the
+//! `SourceEvent` to the mpsc channel — even when swallow is on — so the
+//! edge state machine sees release events for held keys (the M7
+//! stuck-key drain depends on this). The swallow flag *only* controls
+//! the return value to the OS:
+//!   - `swallow == false` → return the original `CGEventRef` (pass-through).
+//!   - `swallow == true`  → return `NULL` for any "swallowable" event
+//!     (mouse motion/button/wheel + key down/up + flags-changed); other
+//!     event types pass through unchanged.
 
 use std::cell::Cell;
 use std::ffi::c_void;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use async_trait::async_trait;
 use core_foundation::base::TCFType;
+use core_foundation::mach_port::{CFMachPort, CFMachPortRef};
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
-use core_graphics::event::{
-    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
-    CGEventType, EventField,
-};
+use core_graphics::event::{CGEventFlags, EventField};
+use core_graphics::geometry::CGPoint;
 use kmwarp_core::hid::macos::macos_to_hid;
 use kmwarp_core::platform::{InputSource, KeyState, ModMask, MouseButton, SourceEvent};
 use tokio::sync::mpsc;
@@ -53,20 +68,100 @@ use tracing::{debug, error, info, trace, warn};
 
 use super::tap_error::TapError;
 
-// The Rust binding's safe `CGEventTap::enable` requires `&self`, but the
-// tap is owned by the run-loop thread and can't be borrowed from inside
-// its own callback. So we re-enable via the C entry point directly,
-// using a `usize` snapshot of the mach-port ref published into a shared
-// `OnceLock` right after tap creation.
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    fn CGEventTapEnable(tap: *mut c_void, enable: bool);
+// ---------------------------------------------------------------------------
+// Raw FFI to CGEventTap entry points.
+// ---------------------------------------------------------------------------
+
+type CGEventRef = *mut c_void;
+type CGEventTapProxy = *const c_void;
+type CGEventMask = u64;
+
+// `CGEventTapLocation` (u32):
+const TAP_LOC_HID: u32 = 0;
+// `CGEventTapPlacement` (u32):
+const TAP_PLACE_HEAD_INSERT: u32 = 0;
+// `CGEventTapOptions` (u32):
+const TAP_OPT_DEFAULT: u32 = 0;
+
+// Subset of `CGEventType` (the wrapper's `#[repr(u32)]` enum). We match
+// on `u32` rather than transmuting so an unknown OS-delivered value can
+// never become UB.
+mod etypes {
+    pub const LEFT_MOUSE_DOWN: u32 = 1;
+    pub const LEFT_MOUSE_UP: u32 = 2;
+    pub const RIGHT_MOUSE_DOWN: u32 = 3;
+    pub const RIGHT_MOUSE_UP: u32 = 4;
+    pub const MOUSE_MOVED: u32 = 5;
+    pub const LEFT_MOUSE_DRAGGED: u32 = 6;
+    pub const RIGHT_MOUSE_DRAGGED: u32 = 7;
+    pub const KEY_DOWN: u32 = 10;
+    pub const KEY_UP: u32 = 11;
+    pub const FLAGS_CHANGED: u32 = 12;
+    pub const SCROLL_WHEEL: u32 = 22;
+    pub const OTHER_MOUSE_DOWN: u32 = 25;
+    pub const OTHER_MOUSE_UP: u32 = 26;
+    pub const OTHER_MOUSE_DRAGGED: u32 = 27;
+    pub const TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFF_FFFE;
+    pub const TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFF_FFFF;
 }
 
-/// Public handle: a stream of `SourceEvent`s plus the shutdown plumbing for
-/// the run-loop and watcher threads.
+/// Signature of the `extern "C"` callback CGEventTap invokes.
+type TapCallback =
+    extern "C" fn(proxy: CGEventTapProxy, etype: u32, event: CGEventRef, user_info: *mut c_void)
+        -> CGEventRef;
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventTapCreate(
+        tap: u32,
+        place: u32,
+        options: u32,
+        events_of_interest: CGEventMask,
+        callback: TapCallback,
+        user_info: *mut c_void,
+    ) -> CFMachPortRef;
+    fn CGEventTapEnable(tap: *mut c_void, enable: bool);
+
+    // Read accessors used inside the callback. We avoid wrapping the
+    // borrowed CGEventRef in the `core_graphics::event::CGEvent` newtype
+    // because that requires the `foreign_types::ForeignType` trait to be
+    // in scope, which would mean another workspace dep. The C symbols
+    // are stable since 10.4.
+    fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    fn CGEventGetFlags(event: CGEventRef) -> u64;
+    fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
+}
+
+/// Tiny safe wrappers around the raw event-field FFI. All take a
+/// borrowed `CGEventRef`; none of them release the ref.
+fn ev_int_field(event: CGEventRef, field: u32) -> i64 {
+    // SAFETY: `event` is non-null at every callsite (callback checks
+    // before invoking translation), and `field` is a documented
+    // `CGEventField` constant from the `EventField` module.
+    unsafe { CGEventGetIntegerValueField(event, field) }
+}
+
+fn ev_flags(event: CGEventRef) -> CGEventFlags {
+    // SAFETY: same as above.
+    let bits = unsafe { CGEventGetFlags(event) };
+    CGEventFlags::from_bits_truncate(bits)
+}
+
+fn ev_location(event: CGEventRef) -> CGPoint {
+    // SAFETY: same as above. `CGPoint` is a plain `#[repr(C)]` struct
+    // of two `f64`s — ABI-stable across the C boundary.
+    unsafe { CGEventGetLocation(event) }
+}
+
+// ---------------------------------------------------------------------------
+// Public handle.
+// ---------------------------------------------------------------------------
+
+/// Owns the tap thread, watcher thread, and the `Arc<AtomicBool>` that
+/// the edge state machine flips to toggle event swallowing.
 pub struct MacInputSource {
     rx: mpsc::UnboundedReceiver<SourceEvent>,
+    swallow: Arc<AtomicBool>,
     // Dropping the Sender wakes the watcher thread, which stops the run loop.
     // `Option` so `Drop` can take it explicitly before joining the threads.
     shutdown: Option<std_mpsc::Sender<()>>,
@@ -84,68 +179,113 @@ impl MacInputSource {
         let (shutdown_tx, shutdown_rx) = std_mpsc::channel::<()>();
         let (rl_tx, rl_rx) = std_mpsc::sync_channel::<Result<CFRunLoop, TapError>>(1);
 
+        let swallow = Arc::new(AtomicBool::new(false));
+
         // Shared mach-port ref so the callback can re-enable on tap-disabled
         // events. The value is set exactly once, immediately after
         // CGEventTapCreate succeeds.
         let port_holder: Arc<OnceLock<usize>> = Arc::new(OnceLock::new());
-        let port_for_cb = Arc::clone(&port_holder);
-        let port_for_publish = Arc::clone(&port_holder);
+
+        let tx_for_thread = event_tx;
+        let swallow_for_thread = Arc::clone(&swallow);
+        let port_for_thread = Arc::clone(&port_holder);
 
         let tap_thread = thread::Builder::new()
             .name("kmwarp-cgtap".into())
             .spawn(move || {
-                // Per-modifier-keycode "currently held" bitmap, lives only
-                // on the tap thread (the closure runs single-threaded inside
-                // its CFRunLoop, so `Cell` is sufficient — no Mutex needed).
-                // See `translate_flags_changed` for the index layout.
-                let held_mods: Cell<u32> = Cell::new(0);
-                let tap_result = CGEventTap::new(
-                    CGEventTapLocation::HID,
-                    CGEventTapPlacement::HeadInsertEventTap,
-                    CGEventTapOptions::Default,
-                    interest_mask(),
-                    move |_proxy, etype, event| {
-                        callback(etype, event, &event_tx, &port_for_cb, &held_mods)
-                    },
-                );
+                // Build the state struct on this thread, leak it into a
+                // raw pointer for `CGEventTapCreate`'s `user_info`. We
+                // reclaim and drop it just before the thread exits.
+                let state = Box::new(TapState {
+                    tx: tx_for_thread,
+                    swallow: swallow_for_thread,
+                    port_holder: Arc::clone(&port_for_thread),
+                    held_mods: Cell::new(0),
+                });
+                let state_ptr = Box::into_raw(state) as *mut c_void;
 
-                let tap = match tap_result {
-                    Ok(t) => t,
-                    Err(()) => {
-                        let _ = rl_tx.send(Err(TapError::TapCreateFailed));
-                        return;
-                    }
+                // SAFETY: extern call with valid types + a non-null
+                // user_info we own. Returns a non-null CFMachPortRef on
+                // success, null on failure (TCC denied etc.).
+                let mach_port_ref = unsafe {
+                    CGEventTapCreate(
+                        TAP_LOC_HID,
+                        TAP_PLACE_HEAD_INSERT,
+                        TAP_OPT_DEFAULT,
+                        make_event_mask(),
+                        cb_thunk,
+                        state_ptr,
+                    )
                 };
+                if mach_port_ref.is_null() {
+                    // SAFETY: we just leaked this in this thread; CG
+                    // never stored it (tap create failed); reclaim.
+                    unsafe {
+                        let _ = Box::from_raw(state_ptr as *mut TapState);
+                    }
+                    let _ = rl_tx.send(Err(TapError::TapCreateFailed));
+                    return;
+                }
 
-                let loop_source = match tap.mach_port.create_runloop_source(0) {
+                // SAFETY: `CGEventTapCreate` returns the mach port with
+                // create-rule retain (refcount +1, we own one). Wrap it
+                // in CFMachPort which will CFRelease on Drop.
+                let port = unsafe { CFMachPort::wrap_under_create_rule(mach_port_ref) };
+
+                let loop_source = match port.create_runloop_source(0) {
                     Ok(s) => s,
                     Err(()) => {
+                        // SAFETY: ditto; we own the leak.
+                        unsafe {
+                            let _ = Box::from_raw(state_ptr as *mut TapState);
+                        }
                         let _ = rl_tx.send(Err(TapError::RunLoopFailed));
                         return;
                     }
                 };
                 let current = CFRunLoop::get_current();
-                // SAFETY: `kCFRunLoopCommonModes` is a CoreFoundation extern
-                // static; access is unsafe but the value is read-only and
-                // valid for the lifetime of the process.
+                // SAFETY: `kCFRunLoopCommonModes` is a CoreFoundation
+                // extern static; access is unsafe but the value is
+                // read-only and valid for the lifetime of the process.
                 let mode = unsafe { kCFRunLoopCommonModes };
                 current.add_source(&loop_source, mode);
 
                 // Publish the mach-port ref so the callback can re-enable
                 // the tap on disabled-by-timeout / disabled-by-user-input.
-                let port_ref = tap.mach_port.as_concrete_TypeRef() as usize;
-                let _ = port_for_publish.set(port_ref);
+                let port_ref = port.as_concrete_TypeRef() as usize;
+                let _ = port_for_thread.set(port_ref);
 
-                tap.enable();
+                // SAFETY: pointer comes from a live CFMachPort owned by
+                // this thread. `CGEventTapEnable` is the documented way
+                // to enable the tap.
+                unsafe { CGEventTapEnable(port_ref as *mut c_void, true) };
 
                 if rl_tx.send(Ok(current)).is_err() {
-                    // Installer was dropped before we got here; exit cleanly.
+                    // Installer was dropped before we got here.
+                    unsafe {
+                        CGEventTapEnable(port_ref as *mut c_void, false);
+                        let _ = Box::from_raw(state_ptr as *mut TapState);
+                    }
                     return;
                 }
 
                 CFRunLoop::run_current();
                 debug!("kmwarp-cgtap thread exiting CFRunLoop");
-                drop(tap); // explicit: tap stays alive across run_current
+
+                // Disable the tap before freeing the user_info, otherwise
+                // a pending callback could dereference freed memory.
+                unsafe {
+                    CGEventTapEnable(port_ref as *mut c_void, false);
+                }
+                drop(port); // CFRelease
+
+                // Reclaim the leaked TapState.
+                // SAFETY: we created this Box in this thread above; no
+                // callback can fire after the tap is disabled + port
+                // released, so no aliasing.
+                unsafe {
+                    let _ = Box::from_raw(state_ptr as *mut TapState);
+                }
             })
             .map_err(|_| TapError::RunLoopFailed)?;
 
@@ -169,10 +309,17 @@ impl MacInputSource {
 
         Ok(Self {
             rx: event_rx,
+            swallow,
             shutdown: Some(shutdown_tx),
             watcher: Some(watcher),
             tap_thread: Some(tap_thread),
         })
+    }
+
+    /// Get a handle to the swallow flag. The edge state machine flips
+    /// this on `StartSwallow` / `StopSwallow` actions. Cheap clone (`Arc`).
+    pub fn swallow_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.swallow)
     }
 }
 
@@ -198,168 +345,254 @@ impl InputSource for MacInputSource {
     }
 }
 
-/// CGEventTap callback body. Kept allocation-free; just translates and
-/// forwards into the unbounded channel.
-fn callback(
-    etype: CGEventType,
-    event: &CGEvent,
-    tx: &mpsc::UnboundedSender<SourceEvent>,
-    port_holder: &OnceLock<usize>,
-    held_mods: &Cell<u32>,
-) -> Option<CGEvent> {
-    match etype {
-        CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
-            if let Some(&mp) = port_holder.get() {
-                // SAFETY: `mp` originated from `CFMachPort::as_concrete_TypeRef`
-                // on the tap's mach port, which is owned by the run-loop
-                // thread for the lifetime of this callback.
-                unsafe { CGEventTapEnable(mp as *mut c_void, true) };
-                warn!(?etype, "CGEventTap auto-reenabled after OS-disable");
-            } else {
-                error!("tap-disabled event arrived before mach port was published");
-            }
-            return None;
+// ---------------------------------------------------------------------------
+// Callback state (leaked into CGEventTap's user_info).
+// ---------------------------------------------------------------------------
+
+struct TapState {
+    tx: mpsc::UnboundedSender<SourceEvent>,
+    swallow: Arc<AtomicBool>,
+    port_holder: Arc<OnceLock<usize>>,
+    /// Per-modifier-keycode held bitmap. See `translate_flags_changed`
+    /// for the index layout. Single-threaded access from the tap thread.
+    held_mods: Cell<u32>,
+}
+
+// SAFETY: `TapState` is only ever dereferenced from the single run-loop
+// thread (`CGEventTapCreate` callbacks fire on the thread that
+// registered the tap with the CFRunLoop). The `Cell<u32>` and
+// `UnboundedSender` fields are touched only there; the `Arc`s are Sync.
+// The Sync impl is needed because we share `&TapState` from the
+// extern "C" thunk; the borrow is single-threaded so there's no actual
+// concurrent access.
+unsafe impl Sync for TapState {}
+
+/// Build the bitmask passed to `CGEventTapCreate`. Bit `n` set means
+/// the OS should deliver event type `n` to the tap. Matches the
+/// `CGEventMaskBit` C macro.
+fn make_event_mask() -> CGEventMask {
+    let types = [
+        // Pointer motion
+        etypes::MOUSE_MOVED,
+        etypes::LEFT_MOUSE_DRAGGED,
+        etypes::RIGHT_MOUSE_DRAGGED,
+        etypes::OTHER_MOUSE_DRAGGED,
+        // Buttons
+        etypes::LEFT_MOUSE_DOWN,
+        etypes::LEFT_MOUSE_UP,
+        etypes::RIGHT_MOUSE_DOWN,
+        etypes::RIGHT_MOUSE_UP,
+        etypes::OTHER_MOUSE_DOWN,
+        etypes::OTHER_MOUSE_UP,
+        // Wheel
+        etypes::SCROLL_WHEEL,
+        // Keyboard
+        etypes::KEY_DOWN,
+        etypes::KEY_UP,
+        etypes::FLAGS_CHANGED,
+    ];
+    let mut mask: CGEventMask = 0;
+    for t in types {
+        mask |= 1u64 << u64::from(t);
+    }
+    mask
+}
+
+/// The `extern "C"` callback CGEventTap invokes. Translates the event,
+/// emits CursorAt for motion, and either passes the event through or
+/// returns NULL to swallow depending on the swallow flag + event type.
+extern "C" fn cb_thunk(
+    _proxy: CGEventTapProxy,
+    etype: u32,
+    event: CGEventRef,
+    user_info: *mut c_void,
+) -> CGEventRef {
+    if user_info.is_null() {
+        // Should never happen — we always pass a valid pointer — but
+        // defend so a bug doesn't crash the system run loop.
+        return event;
+    }
+    // SAFETY: user_info is the `Box<TapState>` we leaked in
+    // `MacInputSource::install`. The Box lives until the tap thread
+    // exits, which only happens after `CGEventTapEnable(_, false)` has
+    // been called on this tap — so no callback can fire after the Box
+    // is reclaimed.
+    let state: &TapState = unsafe { &*(user_info as *const TapState) };
+
+    // Tap-disabled comes before everything else: the OS asks us to
+    // re-enable the tap (it auto-disables on long callback latency or
+    // explicit user input). Always pass through.
+    if etype == etypes::TAP_DISABLED_BY_TIMEOUT
+        || etype == etypes::TAP_DISABLED_BY_USER_INPUT
+    {
+        if let Some(&mp) = state.port_holder.get() {
+            // SAFETY: `mp` originated from a live `CFMachPort` owned by
+            // the tap thread; it's still alive (we're inside its
+            // callback).
+            unsafe { CGEventTapEnable(mp as *mut c_void, true) };
+            warn!(etype, "CGEventTap auto-reenabled after OS-disable");
+        } else {
+            error!("tap-disabled arrived before mach port was published");
         }
-        _ => {}
+        return event;
     }
-    if let Some(ev) = translate(etype, event, held_mods) {
-        // Unbounded send; only fails if the receiver was dropped (consumer
-        // gone). In that case the source is being torn down and the run
-        // loop will stop shortly via the shutdown watcher.
-        let _ = tx.send(ev);
+
+    if event.is_null() {
+        return event;
     }
-    // M6: every mouse-motion event also emits an absolute `CursorAt` so
-    // the edge state machine can see the cursor cross the right edge.
-    // CursorAt is server-internal — never on the wire — but the SM
-    // distinguishes between "you moved by (dx,dy)" and "you're now at
-    // (x,y)" because crossings are detected against absolute screen
-    // coords, not deltas.
+
+    if let Some(src_ev) = translate(etype, event, &state.held_mods) {
+        let _ = state.tx.send(src_ev);
+    }
+    // M6: emit absolute `CursorAt` for motion events so the state
+    // machine can detect right-edge crossings. Always emit (even while
+    // swallowing) — without it the SM can't tell when control should
+    // return to local.
     if is_mouse_motion(etype) {
-        let loc = event.location();
-        // `CGPoint` is logical points; PLAN.md HiDPI normalization is a
-        // M11 follow-up. SM treats the value as opaque screen units.
-        let _ = tx.send(SourceEvent::CursorAt {
+        let loc = ev_location(event);
+        let _ = state.tx.send(SourceEvent::CursorAt {
             x: loc.x as i32,
             y: loc.y as i32,
         });
     }
-    // Pass-through: M2 never swallows. M6 will revisit.
-    None
+
+    // M6 swallow: in `RemoteActive` the local OS must not see the
+    // user's input. Translation+send already happened above so the SM's
+    // stuck-key tracker stays consistent across the transition.
+    if state.swallow.load(Ordering::Relaxed) && is_swallowable(etype) {
+        return ptr::null_mut();
+    }
+    event
 }
 
 /// Mouse-motion event types — the only ones whose absolute location
 /// matters for the edge state machine. Button up/down events also carry
 /// a location but the spec triggers crossings off motion only.
-fn is_mouse_motion(etype: CGEventType) -> bool {
+fn is_mouse_motion(etype: u32) -> bool {
     matches!(
         etype,
-        CGEventType::MouseMoved
-            | CGEventType::LeftMouseDragged
-            | CGEventType::RightMouseDragged
-            | CGEventType::OtherMouseDragged
+        etypes::MOUSE_MOVED
+            | etypes::LEFT_MOUSE_DRAGGED
+            | etypes::RIGHT_MOUSE_DRAGGED
+            | etypes::OTHER_MOUSE_DRAGGED
     )
 }
 
-fn interest_mask() -> Vec<CGEventType> {
-    vec![
-        // Pointer motion
-        CGEventType::MouseMoved,
-        CGEventType::LeftMouseDragged,
-        CGEventType::RightMouseDragged,
-        CGEventType::OtherMouseDragged,
-        // Buttons
-        CGEventType::LeftMouseDown,
-        CGEventType::LeftMouseUp,
-        CGEventType::RightMouseDown,
-        CGEventType::RightMouseUp,
-        CGEventType::OtherMouseDown,
-        CGEventType::OtherMouseUp,
-        // Wheel
-        CGEventType::ScrollWheel,
-        // Keyboard — subscribed so M5 can wire them in without re-installing
-        // the tap. M2's `translate` returns None for these.
-        CGEventType::KeyDown,
-        CGEventType::KeyUp,
-        CGEventType::FlagsChanged,
-    ]
+/// Input event types that the swallow flag suppresses. We swallow
+/// modifier flags-changed too — the user's modifiers should not leak
+/// to local apps while controlling the remote machine.
+fn is_swallowable(etype: u32) -> bool {
+    matches!(
+        etype,
+        etypes::MOUSE_MOVED
+            | etypes::LEFT_MOUSE_DRAGGED
+            | etypes::RIGHT_MOUSE_DRAGGED
+            | etypes::OTHER_MOUSE_DRAGGED
+            | etypes::LEFT_MOUSE_DOWN
+            | etypes::LEFT_MOUSE_UP
+            | etypes::RIGHT_MOUSE_DOWN
+            | etypes::RIGHT_MOUSE_UP
+            | etypes::OTHER_MOUSE_DOWN
+            | etypes::OTHER_MOUSE_UP
+            | etypes::SCROLL_WHEEL
+            | etypes::KEY_DOWN
+            | etypes::KEY_UP
+            | etypes::FLAGS_CHANGED
+    )
 }
 
-fn translate(etype: CGEventType, event: &CGEvent, held_mods: &Cell<u32>) -> Option<SourceEvent> {
-    use CGEventType::{
-        FlagsChanged, KeyDown, KeyUp, LeftMouseDown, LeftMouseDragged, LeftMouseUp, MouseMoved,
-        OtherMouseDown, OtherMouseDragged, OtherMouseUp, RightMouseDown, RightMouseDragged,
-        RightMouseUp, ScrollWheel,
-    };
+fn translate(etype: u32, event: CGEventRef, held_mods: &Cell<u32>) -> Option<SourceEvent> {
     match etype {
-        MouseMoved | LeftMouseDragged | RightMouseDragged | OtherMouseDragged => {
-            let dx = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X);
-            let dy = event.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y);
+        etypes::MOUSE_MOVED
+        | etypes::LEFT_MOUSE_DRAGGED
+        | etypes::RIGHT_MOUSE_DRAGGED
+        | etypes::OTHER_MOUSE_DRAGGED => {
+            let dx = ev_int_field(event, EventField::MOUSE_EVENT_DELTA_X);
+            let dy = ev_int_field(event, EventField::MOUSE_EVENT_DELTA_Y);
             Some(SourceEvent::MouseRel {
                 dx: clamp_i64_to_i16(dx),
                 dy: clamp_i64_to_i16(dy),
             })
         }
-        LeftMouseDown => Some(SourceEvent::MouseButton {
+        etypes::LEFT_MOUSE_DOWN => Some(SourceEvent::MouseButton {
             button: MouseButton::Left,
             state: KeyState::Down,
         }),
-        LeftMouseUp => Some(SourceEvent::MouseButton {
+        etypes::LEFT_MOUSE_UP => Some(SourceEvent::MouseButton {
             button: MouseButton::Left,
             state: KeyState::Up,
         }),
-        RightMouseDown => Some(SourceEvent::MouseButton {
+        etypes::RIGHT_MOUSE_DOWN => Some(SourceEvent::MouseButton {
             button: MouseButton::Right,
             state: KeyState::Down,
         }),
-        RightMouseUp => Some(SourceEvent::MouseButton {
+        etypes::RIGHT_MOUSE_UP => Some(SourceEvent::MouseButton {
             button: MouseButton::Right,
             state: KeyState::Up,
         }),
-        OtherMouseDown => Some(SourceEvent::MouseButton {
+        etypes::OTHER_MOUSE_DOWN => Some(SourceEvent::MouseButton {
             button: other_button(event),
             state: KeyState::Down,
         }),
-        OtherMouseUp => Some(SourceEvent::MouseButton {
+        etypes::OTHER_MOUSE_UP => Some(SourceEvent::MouseButton {
             button: other_button(event),
             state: KeyState::Up,
         }),
-        ScrollWheel => {
-            // Axis 1 = vertical, Axis 2 = horizontal per Apple's docs.
-            let dy = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
-            let dx = event.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
+        etypes::SCROLL_WHEEL => {
+            let dy = ev_int_field(event, EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
+            let dx = ev_int_field(event, EventField::SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
             Some(SourceEvent::MouseWheel {
                 dx: clamp_i64_to_i16(dx),
                 dy: clamp_i64_to_i16(dy),
             })
         }
-        KeyDown => translate_key(event, KeyState::Down),
-        KeyUp => translate_key(event, KeyState::Up),
-        FlagsChanged => translate_flags_changed(event, held_mods),
+        etypes::KEY_DOWN => translate_key(event, KeyState::Down),
+        etypes::KEY_UP => translate_key(event, KeyState::Up),
+        etypes::FLAGS_CHANGED => translate_flags_changed(event, held_mods),
         _ => None,
     }
+}
+
+/// Translate a `kCGEventKeyDown` / `kCGEventKeyUp` event into a
+/// `SourceEvent::Key`. Returns `None` (and emits a `trace!`) when:
+///   - the event is an autorepeat (`kCGKeyboardEventAutorepeat == 1`) — per
+///     the spec's "Key repeat" gotcha, the destination OS regenerates repeats
+///     from a sustained held state, so we forward press + release only;
+///   - the macOS virtual keycode has no entry in `MACOS_VK_TO_HID` (any key
+///     outside the v1 alphanumeric / punctuation / nav / mod set).
+fn translate_key(event: CGEventRef, state: KeyState) -> Option<SourceEvent> {
+    // Autorepeat is only meaningful for KeyDown, but the field is also zero
+    // on KeyUp so we can read it unconditionally and the check is a no-op
+    // for releases. Keeps both arms symmetric.
+    if state == KeyState::Down && ev_int_field(event, EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0 {
+        return None;
+    }
+    let cg_vk = ev_int_field(event, EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+    let hid = match macos_to_hid(cg_vk) {
+        Some(h) => h,
+        None => {
+            trace!(?cg_vk, ?state, "unmapped macOS VK; dropping key event");
+            return None;
+        }
+    };
+    let mods = mods_from_flags(ev_flags(event));
+    Some(SourceEvent::Key {
+        hid_usage: hid,
+        state,
+        mods,
+    })
 }
 
 /// Translate `kCGEventFlagsChanged` into a `SourceEvent::Key { state: … }`.
 ///
 /// macOS doesn't tell us up vs. down directly on a flags-changed event;
 /// it delivers the keycode of the modifier that just transitioned and the
-/// *new* aggregate `CGEventFlags`. The teammate spec suggested XOR'ing the
-/// old vs. new flags integer — but that's ambiguous when the user already
-/// holds (say) Left Shift and then presses Right Shift, since the
-/// aggregate `CGEventFlagShift` bit doesn't flip. So we keep a per-keycode
-/// held-bitmap instead: every FlagsChanged for a tracked modifier vk
-/// flips its bit, and "was previously held" → it's an Up.
-///
-/// Returns `None` (with a `trace!`) when:
-///   - the vk isn't a modifier we track (e.g. raw `Fn` 0x3F — present in
-///     the macOS keyboard but not in v1's HID table);
-///   - the modifier's HID code isn't in `MACOS_VK_TO_HID` (paranoia: the
-///     two should always agree for the keycodes in [`mod_bit`]).
-///
-/// The emitted `mods` field reflects the *aggregate* flags *after* the
-/// transition, which is what the wire-format byte semantically means.
-fn translate_flags_changed(event: &CGEvent, held: &Cell<u32>) -> Option<SourceEvent> {
-    let cg_vk = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+/// *new* aggregate `CGEventFlags`. The aggregate XOR is ambiguous when
+/// one side of a paired modifier is already held (press RShift while
+/// LShift is down — aggregate Shift bit doesn't flip), so we keep a
+/// per-keycode held-bitmap instead.
+fn translate_flags_changed(event: CGEventRef, held: &Cell<u32>) -> Option<SourceEvent> {
+    let cg_vk = ev_int_field(event, EventField::KEYBOARD_EVENT_KEYCODE) as u16;
     let bit_idx = match mod_bit(cg_vk) {
         Some(b) => b,
         None => {
@@ -391,7 +624,7 @@ fn translate_flags_changed(event: &CGEvent, held: &Cell<u32>) -> Option<SourceEv
             return None;
         }
     };
-    let mods = mods_from_flags(event.get_flags());
+    let mods = mods_from_flags(ev_flags(event));
     Some(SourceEvent::Key {
         hid_usage: hid,
         state,
@@ -405,7 +638,7 @@ fn translate_flags_changed(event: &CGEvent, held: &Cell<u32>) -> Option<SourceEv
 ///
 /// Includes both-side variants for Shift/Ctrl/Option/Command plus Caps
 /// Lock. The `Fn` key (0x3F) is intentionally omitted — it isn't in the
-/// v1 HID table and would only confuse downstream consumers.
+/// v1 HID table and forwarding it would only confuse downstream consumers.
 fn mod_bit(vk: u16) -> Option<u8> {
     match vk {
         0x38 => Some(0), // kVK_Shift   (left)
@@ -419,38 +652,6 @@ fn mod_bit(vk: u16) -> Option<u8> {
         0x39 => Some(8), // kVK_CapsLock
         _ => None,
     }
-}
-
-/// Translate a `kCGEventKeyDown` / `kCGEventKeyUp` event into a
-/// `SourceEvent::Key`. Returns `None` (and emits a `trace!`) when:
-///   - the event is an autorepeat (`kCGKeyboardEventAutorepeat == 1`) — per
-///     the spec's "Key repeat" gotcha, the destination OS regenerates repeats
-///     from a sustained held state, so we forward press + release only;
-///   - the macOS virtual keycode has no entry in `MACOS_VK_TO_HID` (any key
-///     outside the v1 alphanumeric / punctuation / nav / mod set).
-fn translate_key(event: &CGEvent, state: KeyState) -> Option<SourceEvent> {
-    // Autorepeat is only meaningful for KeyDown, but the field is also zero
-    // on KeyUp so we can read it unconditionally and the check is a no-op
-    // for releases. Keeps both arms symmetric.
-    if state == KeyState::Down
-        && event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0
-    {
-        return None;
-    }
-    let cg_vk = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-    let hid = match macos_to_hid(cg_vk) {
-        Some(h) => h,
-        None => {
-            trace!(?cg_vk, ?state, "unmapped macOS VK; dropping key event");
-            return None;
-        }
-    };
-    let mods = mods_from_flags(event.get_flags());
-    Some(SourceEvent::Key {
-        hid_usage: hid,
-        state,
-        mods,
-    })
 }
 
 /// Project the aggregate `CGEventFlags` value onto our cross-platform
@@ -475,8 +676,8 @@ fn mods_from_flags(flags: CGEventFlags) -> ModMask {
     m
 }
 
-fn other_button(event: &CGEvent) -> MouseButton {
-    let btn = event.get_integer_value_field(EventField::MOUSE_EVENT_BUTTON_NUMBER);
+fn other_button(event: CGEventRef) -> MouseButton {
+    let btn = ev_int_field(event, EventField::MOUSE_EVENT_BUTTON_NUMBER);
     match btn {
         0 => MouseButton::Left,
         1 => MouseButton::Right,
@@ -544,8 +745,6 @@ mod tests {
 
     #[test]
     fn mod_bit_assigns_unique_indices_for_tracked_modifiers() {
-        // Every documented mod VK gets a unique bit index 0..=8; an
-        // off-list VK returns None.
         let vks = [0x38, 0x3C, 0x3B, 0x3E, 0x3A, 0x3D, 0x37, 0x36, 0x39];
         let mut seen = std::collections::HashSet::new();
         for vk in vks {
@@ -553,21 +752,14 @@ mod tests {
             assert!(bit < 9, "bit index {bit} out of range");
             assert!(seen.insert(bit), "duplicate bit index for vk 0x{vk:X}");
         }
-        // A letter (kVK_ANSI_A = 0x00) and the Fn key (0x3F) are not
-        // tracked modifiers.
         assert_eq!(mod_bit(0x00), None);
         assert_eq!(mod_bit(0x3F), None);
     }
 
     #[test]
     fn flags_changed_held_tracker_flips_state_per_keycode() {
-        // Walk the bitmap directly — we can't fabricate a CGEvent in a
-        // unit test, so we exercise the state transition logic by
-        // re-implementing the same flip-and-test sequence the
-        // `translate_flags_changed` code path uses.
         let held: Cell<u32> = Cell::new(0);
 
-        // Press Left Shift (vk 0x38, bit 0): was_held false → Down.
         let bit_l = 1u32 << mod_bit(0x38).unwrap();
         let prev = held.get();
         let was_held = (prev & bit_l) != 0;
@@ -575,9 +767,6 @@ mod tests {
         assert!(!was_held);
         assert_eq!(held.get(), bit_l);
 
-        // Press Right Shift (vk 0x3C, bit 1) while Left still held:
-        // was_held false → Down. Aggregate Shift bit would have been
-        // unchanged, but per-key state is correct.
         let bit_r = 1u32 << mod_bit(0x3C).unwrap();
         let prev = held.get();
         let was_held = (prev & bit_r) != 0;
@@ -585,14 +774,12 @@ mod tests {
         assert!(!was_held);
         assert_eq!(held.get(), bit_l | bit_r);
 
-        // Release Right Shift: was_held true → Up.
         let prev = held.get();
         let was_held = (prev & bit_r) != 0;
         held.set(prev ^ bit_r);
         assert!(was_held);
         assert_eq!(held.get(), bit_l);
 
-        // Release Left Shift: was_held true → Up.
         let prev = held.get();
         let was_held = (prev & bit_l) != 0;
         held.set(prev ^ bit_l);
@@ -602,13 +789,39 @@ mod tests {
 
     #[test]
     fn mods_from_flags_ignores_non_chord_bits() {
-        // AlphaShift (Caps Lock latch), Help, SecondaryFn (the Fn key),
-        // and the numeric-pad bit should not bleed into ModMask — they
-        // are not wire-format modifiers.
         let noise = CGEventFlags::CGEventFlagAlphaShift
             | CGEventFlags::CGEventFlagHelp
             | CGEventFlags::CGEventFlagSecondaryFn
             | CGEventFlags::CGEventFlagNumericPad;
         assert_eq!(mods_from_flags(noise), ModMask::default());
+    }
+
+    #[test]
+    fn is_swallowable_covers_all_input_event_types() {
+        // Spot-check: every event type the interest mask subscribes to
+        // is also "swallowable" — otherwise RemoteActive would leak
+        // events to local apps.
+        let mask = make_event_mask();
+        for etype in 0u32..=27u32 {
+            if (mask & (1u64 << u64::from(etype))) != 0 {
+                assert!(
+                    is_swallowable(etype),
+                    "etype {etype} is subscribed but not swallowable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn is_mouse_motion_only_motion_events() {
+        assert!(is_mouse_motion(etypes::MOUSE_MOVED));
+        assert!(is_mouse_motion(etypes::LEFT_MOUSE_DRAGGED));
+        assert!(is_mouse_motion(etypes::RIGHT_MOUSE_DRAGGED));
+        assert!(is_mouse_motion(etypes::OTHER_MOUSE_DRAGGED));
+
+        assert!(!is_mouse_motion(etypes::LEFT_MOUSE_DOWN));
+        assert!(!is_mouse_motion(etypes::SCROLL_WHEEL));
+        assert!(!is_mouse_motion(etypes::KEY_DOWN));
+        assert!(!is_mouse_motion(etypes::FLAGS_CHANGED));
     }
 }
