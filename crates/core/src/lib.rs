@@ -5,6 +5,7 @@
 //! and implement the traits exposed here.
 
 pub mod error;
+pub mod hid;
 pub mod platform;
 pub mod stuck_keys;
 pub mod wire;
