@@ -234,12 +234,29 @@ async fn handle_peer(
     // Heartbeat producer: pushes Heartbeat into tx_out every 500 ms.
     set.spawn(heartbeat_producer(remote, tx_out.clone()));
 
+    // M7 stuck-key tracker, shared between the brain (writer) and
+    // `handle_peer`'s post-shutdown drain (reader). The brain task is
+    // the only writer; the disconnect-drain path is the only other
+    // reader.
+    #[cfg(target_os = "macos")]
+    let held: std::sync::Arc<std::sync::Mutex<kmwarp_core::stuck_keys::HeldKeys>> =
+        std::sync::Arc::new(std::sync::Mutex::new(
+            kmwarp_core::stuck_keys::HeldKeys::new(),
+        ));
+
     // Mouse + edge brain (macOS only). Installs the tap, takes the
     // swallow handle, spawns source-forwarder + edge-brain tasks, and
     // returns a `brain_tx` clone so the reader can dispatch
     // `Message::ReleaseControl` into the SM.
     #[cfg(target_os = "macos")]
-    let brain_tx = spawn_input_brain(&mut set, remote, tx_out.clone(), screen_px.0).await;
+    let brain_tx = spawn_input_brain(
+        &mut set,
+        remote,
+        tx_out.clone(),
+        screen_px.0,
+        std::sync::Arc::clone(&held),
+    )
+    .await;
 
     // Reader: decode + dispatch. Pulses notify on every successful read,
     // routes EchoPing → EchoPong, ReleaseControl → brain, optionally
@@ -518,6 +535,7 @@ async fn spawn_input_brain(
     remote: SocketAddr,
     tx_out: mpsc::Sender<Message>,
     screen_w_px: u16,
+    held: std::sync::Arc<std::sync::Mutex<kmwarp_core::stuck_keys::HeldKeys>>,
 ) -> Option<mpsc::Sender<BrainInput>> {
     use crate::platform::macos::MacInputSource;
 
@@ -554,6 +572,7 @@ async fn spawn_input_brain(
         swallow,
         tx_out,
         screen_w_px,
+        held,
     ));
 
     Some(brain_tx)
@@ -674,9 +693,11 @@ fn execute_action(
     tx_out: &mpsc::Sender<Message>,
     swallow: &std::sync::Arc<AtomicBool>,
     mod_remap: &kmwarp_core::modmap::ModRemap,
+    held: &std::sync::Arc<std::sync::Mutex<kmwarp_core::stuck_keys::HeldKeys>>,
 ) {
     use kmwarp_core::edge::Action;
     use kmwarp_core::platform::InputSink;
+    use kmwarp_core::wire::key_state_code;
     use std::sync::atomic::Ordering;
 
     match action {
@@ -687,19 +708,97 @@ fn execute_action(
             enqueue(remote, tx_out, Message::ReleaseControl { exit_y })
         }
         Action::SendMessage(msg) => {
-            enqueue(remote, tx_out, remap_key_message(msg, mod_remap));
+            let remapped = remap_key_message(msg, mod_remap);
+            // Track held keys *after* remap — the destination side
+            // sees the remapped HID, so the drained Up event must
+            // carry the same HID.
+            if let Message::KeyEvent {
+                hid_usage, state, ..
+            } = &remapped
+            {
+                if let Ok(mut h) = held.lock() {
+                    if *state == key_state_code::DOWN {
+                        h.insert(*hid_usage);
+                    } else if *state == key_state_code::UP {
+                        h.remove(*hid_usage);
+                    }
+                }
+            }
+            enqueue(remote, tx_out, remapped);
         }
         Action::WarpLocalCursor { x, y } => sink.warp_cursor_abs(x, y),
         Action::HideLocalCursor => sink.hide_cursor(),
         Action::ShowLocalCursor => sink.show_cursor(),
         Action::StartSwallow => {
             debug!(peer = %remote, "brain: StartSwallow (RemoteActive)");
+            // Spec: "never enter RemoteActive with held keys on the
+            // local side". Defensive drain — should be a no-op since
+            // LocalActive doesn't forward keys.
+            drain_held_to_peer(remote, tx_out, held, /* warn_if_nonempty */ true);
             swallow.store(true, Ordering::Relaxed);
         }
         Action::StopSwallow => {
             debug!(peer = %remote, "brain: StopSwallow (LocalActive)");
+            // Drain whatever the user was holding during RemoteActive
+            // so the Windows side sees a clean release for every key.
+            // No-op if held is empty.
+            drain_held_to_peer(remote, tx_out, held, /* warn_if_nonempty */ false);
             swallow.store(false, Ordering::Relaxed);
         }
+    }
+}
+
+/// Drain the shared `HeldKeys` tracker into `Up`-state `KeyEvent`
+/// messages enqueued through `tx_out`. Used by `StartSwallow`
+/// (defensive — should be empty) and `StopSwallow` (the spec-mandated
+/// release synthesis on every edge transition).
+#[cfg(target_os = "macos")]
+fn drain_held_to_peer(
+    remote: SocketAddr,
+    tx_out: &mpsc::Sender<Message>,
+    held: &std::sync::Arc<std::sync::Mutex<kmwarp_core::stuck_keys::HeldKeys>>,
+    warn_if_nonempty: bool,
+) {
+    use kmwarp_core::wire::key_state_code;
+
+    let hids: Vec<u16> = match held.lock() {
+        Ok(mut h) => h.drain(),
+        Err(poisoned) => {
+            // A poisoned mutex means a prior holder panicked. The
+            // tracker is still recoverable via `into_inner`, but for
+            // M7's purposes we'd rather warn loudly and continue with
+            // whatever state we can read than panic this brain task.
+            warn!(peer = %remote, "HeldKeys mutex poisoned; recovering");
+            poisoned.into_inner().drain()
+        }
+    };
+
+    if hids.is_empty() {
+        return;
+    }
+    if warn_if_nonempty {
+        warn!(
+            peer = %remote,
+            count = hids.len(),
+            "held keys non-empty on StartSwallow — draining defensively"
+        );
+    } else {
+        debug!(
+            peer = %remote,
+            count = hids.len(),
+            "draining held keys on StopSwallow"
+        );
+    }
+    for hid in hids {
+        enqueue(
+            remote,
+            tx_out,
+            Message::KeyEvent {
+                hid_usage: hid,
+                state: key_state_code::UP,
+                modifiers: 0,
+            },
+        );
     }
 }
 
