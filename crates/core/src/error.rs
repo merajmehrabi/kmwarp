@@ -46,3 +46,13 @@ pub enum WireError {
 /// aliases and external signatures don't need to churn later.
 #[derive(Debug, Error)]
 pub enum StateError {}
+
+/// Errors from `[modifiers]` and friends in `~/.config/kmwarp/config.toml`.
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    /// Underlying TOML parse failure; carries the human-readable message
+    /// from the `toml` crate so the binary `fn main()` can surface it
+    /// verbatim.
+    #[error("config parse error: {0}")]
+    Parse(String),
+}
