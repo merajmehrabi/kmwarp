@@ -1,164 +1,207 @@
-//! M6 acceptance: scripted SourceEvent sequences against the edge
-//! state machine, asserting both the action sequence per event and
-//! the "no stuck keys after 50 round trips" invariant.
+//! M6 acceptance: scripted SourceEvent / wire-Message sequences
+//! against the pure edge state machine.
 //!
-//! Tests are purely on `Action` values returned from the state
-//! machine; the mock `InputSink` recorder lives in the server's
-//! integration tests (it's the layer that *executes* actions).
+//! Tests assert directly on the returned `Action` vector; the executor
+//! / sink layer lives in the server crate.
 
-use std::time::{Duration, Instant};
-
-use kmwarp_core::edge::{Action, State, StateMachine, BACK_WARP_PX, EDGE_COOLDOWN};
+use kmwarp_core::edge::{Action, EdgeConfig, State, StateMachine};
 use kmwarp_core::platform::{KeyState, ModMask, MouseButton, SourceEvent};
+use kmwarp_core::wire::{key_state_code, mouse_button_code, Message};
 
-const MAC_SCREEN_W: u32 = 2560;
-
-/// Helper: collect actions into a `Vec` for ergonomic asserts.
-fn run(sm: &mut StateMachine, ev: SourceEvent, now: Instant) -> Vec<Action> {
-    sm.on_source_event(ev, MAC_SCREEN_W, now)
-        .into_iter()
-        .collect()
+/// Standard config used by most tests. Local 1920×1080, default
+/// cooldown 50 ms, back-warp 5 px.
+fn default_cfg() -> EdgeConfig {
+    EdgeConfig::default()
 }
 
-fn release(sm: &mut StateMachine, exit_y: u16, now: Instant) -> Vec<Action> {
-    sm.on_release_control(exit_y, MAC_SCREEN_W, now)
-        .into_iter()
-        .collect()
+/// Collect into a `Vec` for ergonomic asserts.
+fn local(sm: &mut StateMachine, ev: SourceEvent, now_ms: u64) -> Vec<Action> {
+    sm.on_local_event(ev, now_ms).into_iter().collect()
 }
 
+fn wire(sm: &mut StateMachine, msg: Message, now_ms: u64) -> Vec<Action> {
+    sm.on_wire_message(&msg, now_ms).into_iter().collect()
+}
+
+// ──────────────────────────────────────────────────────────────────
+// 1. starts_in_local_active
+// ──────────────────────────────────────────────────────────────────
 #[test]
-fn cursor_crossing_right_edge_emits_full_transition() {
-    let mut sm = StateMachine::new();
-    let t = Instant::now();
+fn starts_in_local_active() {
+    let sm = StateMachine::new(default_cfg());
+    assert_eq!(sm.state(), State::LocalActive);
+}
 
-    let actions = run(
+// ──────────────────────────────────────────────────────────────────
+// 2. local_to_remote_on_right_edge
+// ──────────────────────────────────────────────────────────────────
+#[test]
+fn local_to_remote_on_right_edge() {
+    let cfg = default_cfg();
+    let mut sm = StateMachine::new(cfg);
+
+    let actions = local(
         &mut sm,
         SourceEvent::CursorAt {
-            x: MAC_SCREEN_W as i32 + 5, // just past the edge
-            y: 720,
+            x: cfg.local_screen_w as i32, // exactly at edge — IS a crossing per spec
+            y: 500,
         },
-        t,
+        100,
     );
 
     assert_eq!(sm.state(), State::RemoteActive);
     assert_eq!(
         actions,
         vec![
-            Action::SendTakeControl { entry_y: 720 },
-            Action::WarpLocal {
-                x: MAC_SCREEN_W as i32 - BACK_WARP_PX,
-                y: 720,
+            Action::SendTakeControl { entry_y: 500 },
+            Action::WarpLocalCursor {
+                x: cfg.local_screen_w as i32 - cfg.back_warp_px,
+                y: 500,
             },
-            Action::HideCursor,
+            Action::HideLocalCursor,
             Action::StartSwallow,
         ]
     );
 }
 
 #[test]
-fn cursor_exactly_at_edge_triggers_transition() {
-    let mut sm = StateMachine::new();
-    let t = Instant::now();
-    let actions = run(
+fn cursor_past_edge_also_transitions() {
+    let cfg = default_cfg();
+    let mut sm = StateMachine::new(cfg);
+    let _ = local(
         &mut sm,
         SourceEvent::CursorAt {
-            x: MAC_SCREEN_W as i32, // x == screen_w → cross
+            x: cfg.local_screen_w as i32 + 25, // past the edge
             y: 100,
         },
-        t,
+        100,
     );
     assert_eq!(sm.state(), State::RemoteActive);
-    assert!(matches!(
-        actions.first(),
-        Some(Action::SendTakeControl { entry_y: 100 })
-    ));
 }
 
+// ──────────────────────────────────────────────────────────────────
+// 3. mouse_in_remote_forwards
+// ──────────────────────────────────────────────────────────────────
 #[test]
-fn cursor_inside_screen_does_not_transition() {
-    let mut sm = StateMachine::new();
-    let t = Instant::now();
-    let actions = run(
+fn mouse_in_remote_forwards() {
+    let cfg = default_cfg();
+    let mut sm = StateMachine::new(cfg);
+    // Force into Remote.
+    let _ = local(
         &mut sm,
         SourceEvent::CursorAt {
-            x: MAC_SCREEN_W as i32 - 1,
-            y: 100,
+            x: cfg.local_screen_w as i32 + 1,
+            y: 0,
         },
-        t,
+        100,
     );
-    assert!(actions.is_empty());
-    assert_eq!(sm.state(), State::LocalActive);
-}
-
-#[test]
-fn cooldown_blocks_immediate_re_crossing() {
-    let mut sm = StateMachine::new();
-    let t0 = Instant::now();
-
-    // Cross right.
-    let _ = run(&mut sm, SourceEvent::CursorAt { x: 3000, y: 100 }, t0);
     assert_eq!(sm.state(), State::RemoteActive);
 
-    // Peer hands control back immediately (next millisecond).
-    let _ = release(&mut sm, 100, t0 + Duration::from_millis(1));
-    assert_eq!(sm.state(), State::LocalActive);
-
-    // Within the 50 ms cooldown, another cross attempt is ignored.
-    let actions = run(
-        &mut sm,
-        SourceEvent::CursorAt { x: 3000, y: 100 },
-        t0 + Duration::from_millis(10),
+    // Mouse motion forwards as a SendMessage(Message::MouseMoveRel).
+    let actions = local(&mut sm, SourceEvent::MouseRel { dx: 10, dy: 5 }, 150);
+    assert_eq!(
+        actions,
+        vec![Action::SendMessage(Message::MouseMoveRel { dx: 10, dy: 5 })]
     );
-    assert!(
-        actions.is_empty(),
-        "edge crossing during cooldown should be ignored"
-    );
-    assert_eq!(sm.state(), State::LocalActive);
 }
 
 #[test]
-fn after_cooldown_re_crossing_works() {
-    let mut sm = StateMachine::new();
-    let t0 = Instant::now();
-
-    let _ = run(&mut sm, SourceEvent::CursorAt { x: 3000, y: 100 }, t0);
-    let _ = release(&mut sm, 100, t0 + Duration::from_millis(1));
-
-    // Past the cooldown window.
-    let later = t0 + EDGE_COOLDOWN + Duration::from_millis(5);
-    let actions = run(&mut sm, SourceEvent::CursorAt { x: 3000, y: 200 }, later);
-    assert_eq!(sm.state(), State::RemoteActive);
-    assert!(!actions.is_empty());
-}
-
-#[test]
-fn release_control_emits_unwind_actions() {
-    let mut sm = StateMachine::new();
-    let t0 = Instant::now();
-
-    // Transition into RemoteActive first.
-    let _ = run(
+fn mouse_button_and_wheel_forward_via_send_message() {
+    let cfg = default_cfg();
+    let mut sm = StateMachine::new(cfg);
+    let _ = local(
         &mut sm,
         SourceEvent::CursorAt {
-            x: MAC_SCREEN_W as i32 + 1,
-            y: 100,
+            x: cfg.local_screen_w as i32 + 1,
+            y: 0,
         },
-        t0,
+        100,
     );
 
-    // Far future to avoid cooldown coupling.
-    let t1 = t0 + EDGE_COOLDOWN + Duration::from_millis(10);
-    let actions = release(&mut sm, 555, t1);
+    let actions = local(
+        &mut sm,
+        SourceEvent::MouseButton {
+            button: MouseButton::Right,
+            state: KeyState::Down,
+        },
+        150,
+    );
+    assert_eq!(
+        actions,
+        vec![Action::SendMessage(Message::MouseButton {
+            button: mouse_button_code::RIGHT,
+            state: key_state_code::DOWN,
+        })]
+    );
+
+    let actions = local(&mut sm, SourceEvent::MouseWheel { dx: 0, dy: 3 }, 160);
+    assert_eq!(
+        actions,
+        vec![Action::SendMessage(Message::MouseWheel { dx: 0, dy: 3 })]
+    );
+}
+
+#[test]
+fn key_forwards_via_send_message_in_remote() {
+    let cfg = default_cfg();
+    let mut sm = StateMachine::new(cfg);
+    let _ = local(
+        &mut sm,
+        SourceEvent::CursorAt {
+            x: cfg.local_screen_w as i32 + 1,
+            y: 0,
+        },
+        100,
+    );
+
+    let actions = local(
+        &mut sm,
+        SourceEvent::Key {
+            hid_usage: 0x04, // 'A'
+            state: KeyState::Down,
+            mods: ModMask::SHIFT,
+        },
+        150,
+    );
+    assert_eq!(
+        actions,
+        vec![Action::SendMessage(Message::KeyEvent {
+            hid_usage: 0x04,
+            state: key_state_code::DOWN,
+            modifiers: ModMask::SHIFT.to_wire(),
+        })]
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────
+// 4. release_control_returns_to_local
+// ──────────────────────────────────────────────────────────────────
+#[test]
+fn release_control_returns_to_local() {
+    let cfg = default_cfg();
+    let mut sm = StateMachine::new(cfg);
+    let _ = local(
+        &mut sm,
+        SourceEvent::CursorAt {
+            x: cfg.local_screen_w as i32 + 1,
+            y: 0,
+        },
+        100,
+    );
+
+    // Past cooldown so the release isn't dropped.
+    let t = 100 + u64::from(cfg.thrash_cooldown_ms) + 10;
+    let actions = wire(&mut sm, Message::ReleaseControl { exit_y: 700 }, t);
 
     assert_eq!(sm.state(), State::LocalActive);
     assert_eq!(
         actions,
         vec![
             Action::StopSwallow,
-            Action::ShowCursor,
-            Action::WarpLocal {
-                x: MAC_SCREEN_W as i32 - BACK_WARP_PX,
-                y: 555,
+            Action::ShowLocalCursor,
+            Action::WarpLocalCursor {
+                x: cfg.local_screen_w as i32 - 1,
+                y: 700,
             },
         ]
     );
@@ -166,15 +209,166 @@ fn release_control_emits_unwind_actions() {
 
 #[test]
 fn release_control_in_local_active_is_noop() {
-    let mut sm = StateMachine::new();
-    let actions = release(&mut sm, 100, Instant::now());
+    let mut sm = StateMachine::new(default_cfg());
+    let actions = wire(&mut sm, Message::ReleaseControl { exit_y: 100 }, 1000);
     assert!(actions.is_empty());
     assert_eq!(sm.state(), State::LocalActive);
 }
 
+// ──────────────────────────────────────────────────────────────────
+// 5. thrash_cooldown_blocks_rapid_transitions
+// ──────────────────────────────────────────────────────────────────
 #[test]
-fn mouse_in_local_active_is_not_forwarded() {
-    let mut sm = StateMachine::new();
+fn thrash_cooldown_blocks_rapid_transitions() {
+    let cfg = default_cfg();
+    let mut sm = StateMachine::new(cfg);
+
+    // Drive into Remote at t=100.
+    let _ = local(
+        &mut sm,
+        SourceEvent::CursorAt {
+            x: cfg.local_screen_w as i32 + 1,
+            y: 0,
+        },
+        100,
+    );
+    assert_eq!(sm.state(), State::RemoteActive);
+
+    // Release at t=120 — only 20 ms gap, within the 50 ms cooldown.
+    // Should be dropped silently.
+    let actions = wire(&mut sm, Message::ReleaseControl { exit_y: 100 }, 120);
+    assert!(actions.is_empty(), "release within cooldown is dropped");
+    assert_eq!(sm.state(), State::RemoteActive);
+
+    // At t=200 (100 ms after the entry transition), well past cooldown.
+    let actions = wire(&mut sm, Message::ReleaseControl { exit_y: 100 }, 200);
+    assert!(!actions.is_empty(), "release after cooldown lands");
+    assert_eq!(sm.state(), State::LocalActive);
+
+    // Same idea on the LocalActive → RemoteActive direction: within
+    // 50 ms of the release we just did, a crossing is ignored.
+    let actions = local(
+        &mut sm,
+        SourceEvent::CursorAt {
+            x: cfg.local_screen_w as i32 + 1,
+            y: 0,
+        },
+        240,
+    );
+    assert!(actions.is_empty(), "cross within cooldown is ignored");
+    assert_eq!(sm.state(), State::LocalActive);
+
+    // After the cooldown clears, the same event transitions.
+    let actions = local(
+        &mut sm,
+        SourceEvent::CursorAt {
+            x: cfg.local_screen_w as i32 + 1,
+            y: 0,
+        },
+        260,
+    );
+    assert!(!actions.is_empty(), "cross after cooldown transitions");
+    assert_eq!(sm.state(), State::RemoteActive);
+}
+
+// ──────────────────────────────────────────────────────────────────
+// 6. fifty_round_trips_no_panic
+// ──────────────────────────────────────────────────────────────────
+#[test]
+fn fifty_round_trips_no_panic() {
+    let cfg = default_cfg();
+    let mut sm = StateMachine::new(cfg);
+    let mut now: u64 = 0;
+    let cool = u64::from(cfg.thrash_cooldown_ms) + 1;
+
+    for round in 0..50 {
+        now += cool;
+
+        // Cross right → Remote.
+        let cross_actions = local(
+            &mut sm,
+            SourceEvent::CursorAt {
+                x: cfg.local_screen_w as i32 + 1,
+                y: 100,
+            },
+            now,
+        );
+        assert!(
+            !cross_actions.is_empty(),
+            "round {round}: cross should transition"
+        );
+        assert_eq!(sm.state(), State::RemoteActive);
+
+        // Action sequence shape is the same every round:
+        assert!(matches!(cross_actions[0], Action::SendTakeControl { .. }));
+        assert!(matches!(cross_actions[1], Action::WarpLocalCursor { .. }));
+        assert!(matches!(cross_actions[2], Action::HideLocalCursor));
+        assert!(matches!(cross_actions[3], Action::StartSwallow));
+
+        now += cool;
+
+        // Release → Local.
+        let release_actions = wire(&mut sm, Message::ReleaseControl { exit_y: 100 }, now);
+        assert!(
+            !release_actions.is_empty(),
+            "round {round}: release should transition"
+        );
+        assert_eq!(sm.state(), State::LocalActive);
+
+        assert!(matches!(release_actions[0], Action::StopSwallow));
+        assert!(matches!(release_actions[1], Action::ShowLocalCursor));
+        assert!(matches!(release_actions[2], Action::WarpLocalCursor { .. }));
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// 7. cursor_below_edge_in_local_does_nothing
+// ──────────────────────────────────────────────────────────────────
+#[test]
+fn cursor_below_edge_in_local_does_nothing() {
+    let cfg = default_cfg();
+    let mut sm = StateMachine::new(cfg);
+
+    let actions = local(
+        &mut sm,
+        SourceEvent::CursorAt {
+            x: cfg.local_screen_w as i32 - 1, // one pixel inside
+            y: 500,
+        },
+        100,
+    );
+
+    assert!(actions.is_empty());
+    assert_eq!(sm.state(), State::LocalActive);
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Extra safety nets
+// ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn cursor_at_in_remote_is_ignored_but_updates_last_cursor() {
+    let cfg = default_cfg();
+    let mut sm = StateMachine::new(cfg);
+    // Drive into Remote.
+    let _ = local(
+        &mut sm,
+        SourceEvent::CursorAt {
+            x: cfg.local_screen_w as i32 + 1,
+            y: 0,
+        },
+        100,
+    );
+
+    // A spurious CursorAt while remote should emit no actions.
+    let actions = local(&mut sm, SourceEvent::CursorAt { x: 100, y: 200 }, 150);
+    assert!(actions.is_empty());
+    assert_eq!(sm.state(), State::RemoteActive);
+}
+
+#[test]
+fn mouse_and_key_in_local_active_are_dropped() {
+    let mut sm = StateMachine::new(default_cfg());
     for ev in [
         SourceEvent::MouseRel { dx: 5, dy: 0 },
         SourceEvent::MouseButton {
@@ -182,304 +376,103 @@ fn mouse_in_local_active_is_not_forwarded() {
             state: KeyState::Down,
         },
         SourceEvent::MouseWheel { dx: 0, dy: 1 },
+        SourceEvent::Key {
+            hid_usage: 0x04,
+            state: KeyState::Down,
+            mods: ModMask::default(),
+        },
     ] {
-        let actions = run(&mut sm, ev, Instant::now());
-        assert!(actions.is_empty(), "LocalActive should not forward mouse");
+        let actions = local(&mut sm, ev, 100);
+        assert!(actions.is_empty(), "LocalActive should forward nothing");
     }
-}
-
-#[test]
-fn key_in_local_active_is_not_forwarded() {
-    let mut sm = StateMachine::new();
-    let actions = run(
-        &mut sm,
-        SourceEvent::Key {
-            hid_usage: 0x04,
-            state: KeyState::Down,
-            mods: ModMask::default(),
-        },
-        Instant::now(),
-    );
-    assert!(actions.is_empty());
-    // Held set must remain empty — we never started tracking.
-    assert!(sm.held_keys_empty());
-}
-
-#[test]
-fn mouse_in_remote_active_is_forwarded() {
-    let mut sm = StateMachine::new();
-    let t0 = Instant::now();
-    // Force into RemoteActive.
-    let _ = run(&mut sm, SourceEvent::CursorAt { x: 3000, y: 0 }, t0);
-
-    let actions = run(
-        &mut sm,
-        SourceEvent::MouseRel { dx: 7, dy: -3 },
-        t0 + Duration::from_millis(1),
-    );
-    assert_eq!(actions, vec![Action::ForwardMouseRel { dx: 7, dy: -3 }]);
-
-    let actions = run(
-        &mut sm,
-        SourceEvent::MouseButton {
-            button: MouseButton::Right,
-            state: KeyState::Down,
-        },
-        t0 + Duration::from_millis(2),
-    );
-    assert_eq!(
-        actions,
-        vec![Action::ForwardMouseButton {
-            button: MouseButton::Right,
-            state: KeyState::Down,
-        }]
-    );
-
-    let actions = run(
-        &mut sm,
-        SourceEvent::MouseWheel { dx: 0, dy: 4 },
-        t0 + Duration::from_millis(3),
-    );
-    assert_eq!(actions, vec![Action::ForwardMouseWheel { dx: 0, dy: 4 }]);
-}
-
-#[test]
-fn key_in_remote_active_tracks_held_set() {
-    let mut sm = StateMachine::new();
-    let t0 = Instant::now();
-    let _ = run(&mut sm, SourceEvent::CursorAt { x: 3000, y: 0 }, t0);
-
-    // Shift down + A down.
-    let _ = run(
-        &mut sm,
-        SourceEvent::Key {
-            hid_usage: 0xE1,
-            state: KeyState::Down,
-            mods: ModMask::SHIFT,
-        },
-        t0 + Duration::from_millis(1),
-    );
-    let _ = run(
-        &mut sm,
-        SourceEvent::Key {
-            hid_usage: 0x04,
-            state: KeyState::Down,
-            mods: ModMask::SHIFT,
-        },
-        t0 + Duration::from_millis(2),
-    );
-    assert!(!sm.held_keys_empty(), "two keys should be held");
-
-    // A up.
-    let _ = run(
-        &mut sm,
-        SourceEvent::Key {
-            hid_usage: 0x04,
-            state: KeyState::Up,
-            mods: ModMask::SHIFT,
-        },
-        t0 + Duration::from_millis(3),
-    );
-    // Shift still held.
-    assert!(!sm.held_keys_empty());
-
-    // Shift up.
-    let _ = run(
-        &mut sm,
-        SourceEvent::Key {
-            hid_usage: 0xE1,
-            state: KeyState::Up,
-            mods: ModMask::default(),
-        },
-        t0 + Duration::from_millis(4),
-    );
-    assert!(sm.held_keys_empty(), "all keys released");
-}
-
-#[test]
-fn release_control_drains_held_keys_before_giving_up_control() {
-    let mut sm = StateMachine::new();
-    let t0 = Instant::now();
-    let _ = run(&mut sm, SourceEvent::CursorAt { x: 3000, y: 0 }, t0);
-
-    // User holds Shift+A and then control goes back to the Mac.
-    let _ = run(
-        &mut sm,
-        SourceEvent::Key {
-            hid_usage: 0xE1,
-            state: KeyState::Down,
-            mods: ModMask::SHIFT,
-        },
-        t0 + Duration::from_millis(1),
-    );
-    let _ = run(
-        &mut sm,
-        SourceEvent::Key {
-            hid_usage: 0x04,
-            state: KeyState::Down,
-            mods: ModMask::SHIFT,
-        },
-        t0 + Duration::from_millis(2),
-    );
-
-    let t1 = t0 + EDGE_COOLDOWN + Duration::from_millis(10);
-    let actions = release(&mut sm, 100, t1);
-
-    // First N actions must be ForwardKey{Up} for each held key (order
-    // may vary because HashSet drain isn't ordered); after that the
-    // standard unwind sequence appears.
-    let key_ups: Vec<&Action> = actions
-        .iter()
-        .filter(|a| {
-            matches!(
-                a,
-                Action::ForwardKey {
-                    state: KeyState::Up,
-                    ..
-                }
-            )
-        })
-        .collect();
-    assert_eq!(key_ups.len(), 2, "exactly two keys to release");
-
-    // Tail must be StopSwallow → ShowCursor → WarpLocal.
-    assert!(matches!(actions[actions.len() - 3], Action::StopSwallow));
-    assert!(matches!(actions[actions.len() - 2], Action::ShowCursor));
-    assert!(matches!(
-        actions[actions.len() - 1],
-        Action::WarpLocal { .. }
-    ));
-
-    assert!(sm.held_keys_empty(), "drain must leave held set empty");
     assert_eq!(sm.state(), State::LocalActive);
 }
 
 #[test]
-fn drain_held_keys_helper_returns_releases_for_each_held() {
-    let mut sm = StateMachine::new();
-    let t0 = Instant::now();
-    let _ = run(&mut sm, SourceEvent::CursorAt { x: 3000, y: 0 }, t0);
-    for hid in [0xE1u16, 0x04, 0x16] {
-        let _ = run(
-            &mut sm,
-            SourceEvent::Key {
-                hid_usage: hid,
-                state: KeyState::Down,
-                mods: ModMask::default(),
-            },
-            t0 + Duration::from_millis(1),
-        );
-    }
-    assert_eq!(sm.drain_held_keys().len(), 3);
-    assert!(sm.held_keys_empty());
-}
-
-/// **The M6 acceptance test, spec verbatim:**
-/// > No stuck keys after 50 round trips.
-///
-/// Scripted scenario: 50 times, cross the edge, hold a key,
-/// receive ReleaseControl, assert no held keys leak across
-/// transitions and the state returns to LocalActive each time.
-#[test]
-fn no_stuck_keys_after_50_round_trips() {
-    let mut sm = StateMachine::new();
-    let mut t = Instant::now();
-
-    for round in 0..50 {
-        // Skip past cooldown so the next cross is allowed (after the
-        // previous round's release set last_transition).
-        t += EDGE_COOLDOWN + Duration::from_millis(1);
-
-        // Cross right.
-        let actions = run(&mut sm, SourceEvent::CursorAt { x: 3000, y: 100 }, t);
-        assert!(
-            !actions.is_empty(),
-            "round {round}: cross should transition"
-        );
-        assert_eq!(sm.state(), State::RemoteActive);
-        t += Duration::from_millis(1);
-
-        // Hold Shift + a random letter.
-        let _ = run(
-            &mut sm,
-            SourceEvent::Key {
-                hid_usage: 0xE1,
-                state: KeyState::Down,
-                mods: ModMask::SHIFT,
-            },
-            t,
-        );
-        t += Duration::from_millis(1);
-        let _ = run(
-            &mut sm,
-            SourceEvent::Key {
-                hid_usage: 0x04 + (round as u16 % 26),
-                state: KeyState::Down,
-                mods: ModMask::SHIFT,
-            },
-            t,
-        );
-        t += Duration::from_millis(1);
-
-        // Peer hands control back. Drain MUST release both held keys.
-        t += EDGE_COOLDOWN + Duration::from_millis(1); // skip cooldown
-        let actions = release(&mut sm, 100, t);
-
-        let key_ups = actions
-            .iter()
-            .filter(|a| {
-                matches!(
-                    a,
-                    Action::ForwardKey {
-                        state: KeyState::Up,
-                        ..
-                    }
-                )
-            })
-            .count();
-        assert_eq!(
-            key_ups, 2,
-            "round {round}: expected exactly 2 ForwardKey{{Up}} on release"
-        );
-        assert!(
-            sm.held_keys_empty(),
-            "round {round}: held set must be empty after release"
-        );
-        assert_eq!(sm.state(), State::LocalActive);
-
-        t += Duration::from_millis(1);
-    }
-}
-
-#[test]
-fn cursor_at_in_remote_active_is_ignored() {
-    let mut sm = StateMachine::new();
-    let t0 = Instant::now();
-    // Cross.
-    let _ = run(&mut sm, SourceEvent::CursorAt { x: 3000, y: 0 }, t0);
-    // CursorAt arriving while remote is active should be a no-op.
-    let actions = run(
+fn non_release_wire_messages_are_ignored() {
+    let cfg = default_cfg();
+    let mut sm = StateMachine::new(cfg);
+    // Drive into Remote.
+    let _ = local(
         &mut sm,
-        SourceEvent::CursorAt { x: 100, y: 100 },
-        t0 + Duration::from_millis(1),
+        SourceEvent::CursorAt {
+            x: cfg.local_screen_w as i32 + 1,
+            y: 0,
+        },
+        100,
     );
-    assert!(actions.is_empty());
+
+    let irrelevant = [
+        Message::Heartbeat { seq: 1 },
+        Message::Bye { reason_code: 0 },
+        Message::EchoPing { ts_ns: 0 },
+        Message::HelloAck {
+            accepted: true,
+            server_screen_px: (1, 1),
+        },
+        Message::MouseMoveRel { dx: 0, dy: 0 }, // mouse from peer — not our concern
+    ];
+    for msg in irrelevant {
+        let actions = wire(&mut sm, msg, 200);
+        assert!(actions.is_empty(), "non-release wire msgs ignored");
+    }
     assert_eq!(sm.state(), State::RemoteActive);
 }
 
 #[test]
-fn transition_actions_are_in_correct_order() {
-    // Spec requires SendTakeControl first (so peer warps before any
-    // forwarded motion arrives), then WarpLocal, then HideCursor,
-    // then StartSwallow.
-    let mut sm = StateMachine::new();
-    let actions = run(
+fn entry_y_clamps_to_u16() {
+    let cfg = default_cfg();
+    let mut sm = StateMachine::new(cfg);
+    // y above u16::MAX — clamp to u16::MAX.
+    let actions = local(
         &mut sm,
-        SourceEvent::CursorAt { x: 3000, y: 100 },
-        Instant::now(),
+        SourceEvent::CursorAt {
+            x: cfg.local_screen_w as i32 + 1,
+            y: 100_000,
+        },
+        100,
     );
-    assert!(matches!(actions[0], Action::SendTakeControl { .. }));
-    assert!(matches!(actions[1], Action::WarpLocal { .. }));
-    assert!(matches!(actions[2], Action::HideCursor));
-    assert!(matches!(actions[3], Action::StartSwallow));
+    assert_eq!(actions[0], Action::SendTakeControl { entry_y: u16::MAX });
+
+    // Reset.
+    let cfg2 = default_cfg();
+    let mut sm2 = StateMachine::new(cfg2);
+    let actions = local(
+        &mut sm2,
+        SourceEvent::CursorAt {
+            x: cfg2.local_screen_w as i32 + 1,
+            y: -10,
+        },
+        100,
+    );
+    assert_eq!(actions[0], Action::SendTakeControl { entry_y: 0 });
+}
+
+#[test]
+fn custom_config_is_honored() {
+    let cfg = EdgeConfig {
+        local_screen_w: 2560,
+        local_screen_h: 1440,
+        remote_screen_w: 1920,
+        remote_screen_h: 1080,
+        thrash_cooldown_ms: 100,
+        back_warp_px: 10,
+    };
+    let mut sm = StateMachine::new(cfg);
+
+    // Cross at the wider screen's edge.
+    let actions = local(&mut sm, SourceEvent::CursorAt { x: 2560, y: 50 }, 100);
+    assert!(matches!(
+        actions[1],
+        Action::WarpLocalCursor { x: 2550, y: 50 }
+    ));
+
+    // 100 ms cooldown — release at +99 ms is dropped.
+    let release_at_99 = wire(&mut sm, Message::ReleaseControl { exit_y: 0 }, 199);
+    assert!(release_at_99.is_empty());
+
+    // +101 ms passes.
+    let release_at_101 = wire(&mut sm, Message::ReleaseControl { exit_y: 0 }, 201);
+    assert!(!release_at_101.is_empty());
+    assert_eq!(sm.state(), State::LocalActive);
 }
