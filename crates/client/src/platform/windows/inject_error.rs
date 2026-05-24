@@ -34,3 +34,24 @@ pub enum InjectError {
     #[error("input injection failed: {0}")]
     Other(String),
 }
+
+/// Failure modes for clipboard install / read / write.
+///
+/// Install can fail if `RegisterClassW` / `CreateWindowExW` /
+/// `AddClipboardFormatListener` return errors; read/write usually fail
+/// only because another process holds the global clipboard lock — we
+/// retry briefly and then surface this rather than spin forever.
+#[derive(Debug, Error)]
+pub enum ClipboardError {
+    /// Could not install the message-only window listener.
+    #[error("clipboard listener install failed: {0}")]
+    Init(String),
+
+    /// Could not open / read the global clipboard.
+    #[error("clipboard read failed: {0}")]
+    Read(String),
+
+    /// Could not open / write the global clipboard.
+    #[error("clipboard write failed: {0}")]
+    Write(String),
+}
