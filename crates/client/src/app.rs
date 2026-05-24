@@ -30,6 +30,7 @@
 //! we propagate `Err`.
 
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -160,7 +161,16 @@ async fn run_one_session(
     Ok(())
 }
 
-/// Spawn the four-task session graph and wait for the first exit.
+/// Spawn the session task graph and wait for the first exit.
+///
+/// Tasks (four base + one Windows-only):
+/// - `encoder_loop` — drains the outbound channel to the socket.
+/// - `heartbeat_producer` — 500 ms ticks of `Heartbeat`.
+/// - `injector_loop` — dispatches inbound frames; toggles `active` on
+///   `TakeControl` / `ReleaseControl`.
+/// - `deadline_watcher` — 2 s peer-silence detector.
+/// - `cursor_leave_watcher` (Windows only) — 60 Hz `GetCursorPos` poll;
+///   emits `ReleaseControl` when the cursor crosses the left edge.
 async fn run_session_tasks(
     addr: SocketAddr,
     reader: FrameReader,
@@ -169,6 +179,11 @@ async fn run_session_tasks(
 ) {
     let (tx_out, rx_out) = mpsc::channel::<Message>(OUTBOUND_CHANNEL_BOUND);
     let notify = Arc::new(Notify::new());
+    // `active` flips to true on `TakeControl` and false on the Windows
+    // cursor-leave watcher's release. Lives in `app` so its lifetime is
+    // exactly one session — a fresh `Arc` per reconnect prevents stale
+    // state carrying over.
+    let active = Arc::new(AtomicBool::new(false));
 
     let mut set: JoinSet<TaskExit> = JoinSet::new();
 
@@ -180,8 +195,23 @@ async fn run_session_tasks(
         sink,
         Arc::clone(&notify),
         tx_out.clone(),
+        Arc::clone(&active),
     ));
     set.spawn(deadline_watcher(addr, notify));
+
+    // Windows-only: spawn the cursor-leave watcher. On non-Windows hosts
+    // (macOS dev box, Linux CI) the watcher doesn't exist and `active`
+    // is set/read but otherwise ignored — the NoOpSink doesn't care.
+    #[cfg(target_os = "windows")]
+    {
+        use crate::platform::windows::{cursor_leave_watcher, primary_screen_size};
+        let safe_warp_x = (primary_screen_size().0 / 2).max(1);
+        set.spawn(spawn_cursor_watcher(
+            tx_out.clone(),
+            Arc::clone(&active),
+            safe_warp_x,
+        ));
+    }
 
     // Drop the original sender so the channel closes once every task-held
     // clone is dropped (clean shutdown drain).
@@ -216,11 +246,27 @@ async fn spawn_injector(
     sink: DefaultSink,
     notify: Arc<Notify>,
     tx_out: mpsc::Sender<Message>,
+    active: Arc<AtomicBool>,
 ) -> TaskExit {
-    match injector_loop(reader, sink, notify, tx_out).await {
+    match injector_loop(reader, sink, notify, tx_out, active).await {
         Ok(()) => TaskExit::PeerByeOrClose,
         Err(e) => TaskExit::ReaderFailed(e.to_string()),
     }
+}
+
+/// Windows-only: drive the cursor-leave watcher and convert its
+/// completion (only happens if the outbound channel closes) into a
+/// generic `CursorWatcherExited` so the JoinSet can log it alongside
+/// the other tasks.
+#[cfg(target_os = "windows")]
+async fn spawn_cursor_watcher(
+    tx_out: mpsc::Sender<Message>,
+    active: Arc<AtomicBool>,
+    safe_warp_x: i32,
+) -> TaskExit {
+    use crate::platform::windows::cursor_leave_watcher;
+    cursor_leave_watcher(tx_out, active, safe_warp_x).await;
+    TaskExit::CursorWatcherExited
 }
 
 #[derive(Debug)]
@@ -231,6 +277,10 @@ enum TaskExit {
     ReaderFailed(String),
     PeerByeOrClose,
     DeadlineExpired,
+    /// Windows-only: cursor-leave watcher exited (only happens if the
+    /// outbound channel closes mid-session).
+    #[cfg(target_os = "windows")]
+    CursorWatcherExited,
     JoinError,
 }
 
@@ -248,6 +298,10 @@ fn log_exit(addr: SocketAddr, exit: TaskExit) {
         }
         TaskExit::PeerByeOrClose => info!(addr = %addr, "peer sent Bye; ending session"),
         TaskExit::DeadlineExpired => debug!(addr = %addr, "deadline watcher fired"),
+        #[cfg(target_os = "windows")]
+        TaskExit::CursorWatcherExited => {
+            debug!(addr = %addr, "cursor-leave watcher exited; tearing down")
+        }
         TaskExit::JoinError => warn!(addr = %addr, "task join error"),
     }
 }

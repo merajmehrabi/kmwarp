@@ -13,6 +13,7 @@
 //! server and client cannot drift on `MouseButton.button` / `.state`
 //! dictionary values.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use kmwarp_core::wire::{apply_key_to_sink, apply_mouse_to_sink, Message};
@@ -38,7 +39,9 @@ pub async fn encoder_loop(
 }
 
 /// Continuously decode frames from `reader`, pulse `notify`, dispatch
-/// mouse to `sink`, and bounce `EchoPing` back as `EchoPong` via `tx_out`.
+/// mouse/key to `sink`, bounce `EchoPing` back as `EchoPong` via
+/// `tx_out`, and toggle `active` on `TakeControl` / `ReleaseControl` so
+/// the M6 cursor-leave watcher (Windows-only) knows when to poll.
 ///
 /// Generic over the sink so the same loop drives a real
 /// [`crate::platform::WinInputSink`] on Windows and the
@@ -51,6 +54,7 @@ pub async fn injector_loop<S: InputSink + Send>(
     mut sink: S,
     notify: Arc<Notify>,
     tx_out: mpsc::Sender<Message>,
+    active: Arc<AtomicBool>,
 ) -> Result<(), ClientError> {
     loop {
         let msg = reader.read_frame().await?;
@@ -88,10 +92,27 @@ pub async fn injector_loop<S: InputSink + Send>(
             Message::Hello { .. } | Message::HelloAck { .. } => {
                 warn!(?msg, "unexpected post-handshake control frame");
             }
-            Message::ClipboardText { .. }
-            | Message::TakeControl { .. }
-            | Message::ReleaseControl { .. } => {
-                trace!(?msg, "received frame; M6/M8 will handle");
+            Message::TakeControl { entry_y } => {
+                // Spec §M6: warp our cursor to the left edge at the y
+                // the server reported, then arm the leave-watcher. We
+                // go through the sink's `warp_cursor_abs` so the
+                // non-Windows NoOpSink doesn't try to call `SetCursorPos`.
+                info!(entry_y, "received TakeControl; activating");
+                sink.warp_cursor_abs(0, i32::from(entry_y));
+                active.store(true, Ordering::Relaxed);
+            }
+            Message::ReleaseControl { .. } => {
+                // Defensive: v1 wire convention is client→server only
+                // for ReleaseControl. Log and ignore rather than treat
+                // as a fault — a future bidirectional version may use
+                // this arm legitimately.
+                trace!(
+                    ?msg,
+                    "received ReleaseControl from server (unusual); ignoring"
+                );
+            }
+            Message::ClipboardText { .. } => {
+                trace!(?msg, "received frame; M8 will handle");
             }
             // `apply_mouse_to_sink` / `apply_key_to_sink` covered these
             // above; the compiler can't tell, so fall through.
