@@ -45,6 +45,9 @@ directories = "5"
 # Test deps
 proptest = "1"
 
+# Latency probe (optional, gated behind `latency-probe` feature)
+hdrhistogram = "7"
+
 # macOS-only platform deps
 core-graphics = "0.24"
 core-foundation = "0.10"

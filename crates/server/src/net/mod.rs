@@ -5,5 +5,7 @@
 //! the parent `app` module.
 
 pub mod connection;
+pub mod pump;
 
 pub use connection::{Connection, FrameReader, FrameWriter};
+pub use pump::encoder_loop;

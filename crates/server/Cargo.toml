@@ -11,8 +11,16 @@ description = "kmwarp macOS server: captures input and forwards to a paired Wind
 name = "kmwarp-server"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enables the M4 latency-probe harness: a periodic EchoPing emitter and an
+# hdrhistogram-backed RTT recorder. Off by default to keep the steady-state
+# binary lean. Turn on with `cargo run -p kmwarp-server --features latency-probe`.
+latency-probe = ["dep:hdrhistogram"]
+
 [dependencies]
 kmwarp-core = { path = "../core" }
+hdrhistogram = { workspace = true, optional = true }
 
 tokio = { workspace = true }
 bytes = { workspace = true }
