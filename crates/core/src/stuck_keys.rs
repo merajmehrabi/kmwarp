@@ -4,25 +4,27 @@
 //! 1. [`HeldKeys`] tracks the set of HID usage codes currently down on
 //!    the destination side. The server's RemoteActive path inserts on
 //!    every `KeyEvent { Down }` it forwards, and removes on every `Up`.
+//!    (Use [`HeldKeys::observe`] for one-line dispatch from a
+//!    `KeyState`.)
 //! 2. On any RemoteActive exit — edge transition, peer `Bye`, heartbeat
-//!    timeout, TCP RST, SIGTERM — the runtime calls
-//!    [`HeldKeys::drain_release_actions`] and queues the returned
-//!    [`Action`]s synchronously into the encoder before the connection
+//!    timeout, TCP RST, SIGTERM — the runtime calls [`HeldKeys::drain`],
+//!    constructs `KeyEvent { Up }` releases for each returned HID, and
+//!    pushes them synchronously into the encoder before the connection
 //!    tears down. The Windows side sees a clean release for every key
 //!    the user was still holding.
 //!
-//! The data structure itself stays in `core` (no platform deps) so the
-//! same tracker covers Mac→Win, Win→Mac (future), and any test harness
-//! that wants to verify the invariant.
+//! `BTreeSet`-backed: drain order is deterministic (sorted ascending by
+//! HID), so test scripts can assert exact action sequences. The tracker
+//! has zero platform deps and zero `edge::Action` knowledge — the
+//! Action wrapping happens at the runtime composition layer.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 
-use crate::edge::Action;
-use crate::wire::{key_state_code, Message};
+use crate::platform::KeyState;
 
 #[derive(Default, Debug, Clone)]
 pub struct HeldKeys {
-    keys: HashSet<u16>,
+    keys: BTreeSet<u16>,
 }
 
 impl HeldKeys {
@@ -42,43 +44,6 @@ impl HeldKeys {
         self.keys.contains(&hid)
     }
 
-    /// Drain all currently-held HID codes into a `Vec`, leaving the
-    /// tracker empty. Returns the raw HID set — callers that need
-    /// wire-side release actions should use
-    /// [`HeldKeys::drain_release_actions`] instead.
-    pub fn drain_held(&mut self) -> Vec<u16> {
-        self.keys.drain().collect()
-    }
-
-    /// **M7 entry point.** Drain every held key into a `Vec<Action>`
-    /// of `Action::SendMessage(Message::KeyEvent { state: Up,
-    /// modifiers: 0 })`, ready for the server runtime to push into
-    /// the encoder.
-    ///
-    /// The modifier byte is set to 0 because we're synthesizing
-    /// releases that should land on the destination side without any
-    /// implicit chord — if Shift itself is one of the held keys, its
-    /// release event still goes out cleanly.
-    ///
-    /// Per PLAN.md §M7, this is called from:
-    /// - every `RemoteActive ↔ LocalActive` edge transition,
-    /// - the `Bye` / heartbeat-timeout / TCP-RST / SIGTERM shutdown
-    ///   paths,
-    ///
-    /// **synchronously** before the encoder task exits.
-    pub fn drain_release_actions(&mut self) -> Vec<Action> {
-        self.keys
-            .drain()
-            .map(|hid| {
-                Action::SendMessage(Message::KeyEvent {
-                    hid_usage: hid,
-                    state: key_state_code::UP,
-                    modifiers: 0,
-                })
-            })
-            .collect()
-    }
-
     pub fn len(&self) -> usize {
         self.keys.len()
     }
@@ -86,37 +51,89 @@ impl HeldKeys {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+
+    /// One-line dispatch helper: `Down → insert`, `Up → remove`. Cuts
+    /// the boilerplate in the server/client forwarding loops.
+    pub fn observe(&mut self, hid: u16, state: KeyState) {
+        match state {
+            KeyState::Down => self.insert(hid),
+            KeyState::Up => self.remove(hid),
+        }
+    }
+
+    /// Borrowed iteration in deterministic (sorted) order. Useful for
+    /// tracing / diagnostics without draining the set.
+    pub fn iter(&self) -> impl Iterator<Item = u16> + '_ {
+        self.keys.iter().copied()
+    }
+
+    /// Return all currently-held HIDs in deterministic order and
+    /// empty the tracker.
+    ///
+    /// Used at:
+    /// - every `RemoteActive ↔ LocalActive` edge transition,
+    /// - the `Bye` / heartbeat-timeout / TCP-RST / SIGTERM shutdown
+    ///   paths,
+    ///
+    /// synchronously before the encoder task exits. The caller is
+    /// expected to wrap each returned HID into a wire
+    /// `Message::KeyEvent { state: Up, modifiers: 0 }` and push it
+    /// through the connection writer.
+    pub fn drain(&mut self) -> Vec<u16> {
+        let taken = std::mem::take(&mut self.keys);
+        taken.into_iter().collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     #[test]
-    fn insert_then_drain_yields_held_keys_and_empties_set() {
+    fn insert_and_drain_returns_all_held_in_order() {
         let mut h = HeldKeys::new();
-        assert!(h.is_empty());
-        h.insert(0x04); // a
-        h.insert(0x05); // b
-        h.insert(0x04); // duplicate, set-like
-        assert_eq!(h.len(), 2);
-        assert!(h.is_held(0x04));
-        assert!(h.is_held(0x05));
-        assert!(!h.is_held(0x06));
+        h.insert(0x10);
+        h.insert(0x04);
+        h.insert(0xE1);
+        h.insert(0x04); // dup, set-like
+        assert_eq!(h.len(), 3);
 
-        let mut drained = h.drain_held();
-        drained.sort_unstable();
-        assert_eq!(drained, vec![0x04, 0x05]);
+        let drained = h.drain();
+        // BTreeSet → drain returns sorted ascending.
+        assert_eq!(drained, vec![0x04, 0x10, 0xE1]);
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn observe_dispatches_insert_or_remove_by_state() {
+        let mut h = HeldKeys::new();
+        h.observe(0xE1, KeyState::Down);
+        assert!(h.is_held(0xE1));
+        h.observe(0x04, KeyState::Down);
+        assert_eq!(h.len(), 2);
+        h.observe(0xE1, KeyState::Up);
+        assert!(!h.is_held(0xE1));
+        assert!(h.is_held(0x04));
+    }
+
+    #[test]
+    fn drain_leaves_empty() {
+        let mut h = HeldKeys::new();
+        h.insert(0x04);
+        h.insert(0xE1);
+        let _ = h.drain();
         assert!(h.is_empty());
         assert!(!h.is_held(0x04));
+        assert!(!h.is_held(0xE1));
+        // Second drain on an empty set is also fine.
+        assert!(h.drain().is_empty());
     }
 
     #[test]
     fn remove_clears_individual_keys() {
         let mut h = HeldKeys::new();
-        h.insert(0xE1); // left shift
-        h.insert(0xE0); // left ctrl
+        h.insert(0xE1);
+        h.insert(0xE0);
         h.remove(0xE1);
         assert!(!h.is_held(0xE1));
         assert!(h.is_held(0xE0));
@@ -124,39 +141,14 @@ mod tests {
     }
 
     #[test]
-    fn drain_release_actions_yields_one_keyup_per_held() {
+    fn iter_yields_held_in_sorted_order_without_consuming() {
         let mut h = HeldKeys::new();
-        h.insert(0xE1); // LShift
-        h.insert(0x04); // A
-        h.insert(0x05); // B
-        let actions = h.drain_release_actions();
-        assert_eq!(actions.len(), 3);
-        // Tracker is empty after drain.
-        assert!(h.is_empty());
-
-        // Each action must be a SendMessage with KeyEvent{state: Up,
-        // modifiers: 0} carrying one of the held HIDs.
-        let mut emitted_hids: HashSet<u16> = HashSet::new();
-        for a in actions {
-            match a {
-                Action::SendMessage(Message::KeyEvent {
-                    hid_usage,
-                    state,
-                    modifiers,
-                }) => {
-                    assert_eq!(state, key_state_code::UP);
-                    assert_eq!(modifiers, 0);
-                    emitted_hids.insert(hid_usage);
-                }
-                other => panic!("unexpected action: {other:?}"),
-            }
+        for hid in [0xE1, 0x04, 0x10] {
+            h.insert(hid);
         }
-        assert_eq!(emitted_hids, HashSet::from([0xE1, 0x04, 0x05]));
-    }
-
-    #[test]
-    fn drain_release_actions_on_empty_is_empty() {
-        let mut h = HeldKeys::new();
-        assert!(h.drain_release_actions().is_empty());
+        let collected: Vec<u16> = h.iter().collect();
+        assert_eq!(collected, vec![0x04, 0x10, 0xE1]);
+        // Set is still populated after iter.
+        assert_eq!(h.len(), 3);
     }
 }
