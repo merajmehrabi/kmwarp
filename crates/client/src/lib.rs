@@ -5,5 +5,6 @@
 //! inside the library so the M10 Windows-service split can call into it
 //! without rebuilding the binary.
 
+pub mod app;
 pub mod error;
 pub mod net;
