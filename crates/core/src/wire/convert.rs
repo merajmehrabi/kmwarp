@@ -12,6 +12,7 @@
 //! converting its native units to/from this convention; the helpers here
 //! are byte-pure (i.e. they do not do unit conversion).
 
+use crate::config::ModRemap;
 use crate::platform::{InputSink, KeyState, ModMask, MouseButton, SourceEvent};
 use crate::wire::{key_state_code, mouse_button_code, Message};
 
@@ -63,6 +64,12 @@ pub fn key_state_to_byte(s: KeyState) -> u8 {
 /// signal for the M6 edge state machine, never on the wire. Also returns
 /// `None` for any future variant we don't yet route (caller treats `None`
 /// as "drop silently").
+///
+/// **Modifier remap is NOT applied here** — the modifier byte goes out
+/// as-is. The M6 state machine calls this from RemoteActive; the M7
+/// server runtime that owns the state machine should call
+/// [`source_event_to_message_remapped`] instead so the configured
+/// `[modifiers]` mapping (Cmd→Ctrl by default) takes effect.
 pub fn source_event_to_message(ev: SourceEvent) -> Option<Message> {
     match ev {
         SourceEvent::MouseRel { dx, dy } => Some(Message::MouseMoveRel { dx, dy }),
@@ -81,6 +88,29 @@ pub fn source_event_to_message(ev: SourceEvent) -> Option<Message> {
             modifiers: mods.to_wire(),
         }),
         SourceEvent::CursorAt { .. } => None,
+    }
+}
+
+/// Like [`source_event_to_message`] but applies a [`ModRemap`] to the
+/// modifier byte of `SourceEvent::Key` events. Mouse / wheel / button
+/// variants pass through unchanged.
+///
+/// This is the M7 hook the server runtime should call from its
+/// RemoteActive forwarding path so Cmd+C on the Mac arrives as Ctrl+C
+/// on the wire.
+pub fn source_event_to_message_remapped(ev: SourceEvent, remap: &ModRemap) -> Option<Message> {
+    match ev {
+        SourceEvent::Key {
+            hid_usage,
+            state,
+            mods,
+        } => Some(Message::KeyEvent {
+            hid_usage,
+            state: key_state_to_byte(state),
+            modifiers: remap.apply(mods).to_wire(),
+        }),
+        // Non-key events are unaffected by modifier remap; delegate.
+        other => source_event_to_message(other),
     }
 }
 

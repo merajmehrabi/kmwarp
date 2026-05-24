@@ -19,6 +19,7 @@ pub use codec::{decode_frame, encode_frame};
 pub use convert::{
     apply_key_to_sink, apply_mouse_to_sink, byte_to_key_state, byte_to_mouse_button,
     key_state_to_byte, mouse_button_to_byte, source_event_to_message,
+    source_event_to_message_remapped,
 };
 
 /// Wire protocol version negotiated in `Hello` / `HelloAck`.
