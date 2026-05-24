@@ -106,9 +106,12 @@ mod etypes {
 }
 
 /// Signature of the `extern "C"` callback CGEventTap invokes.
-type TapCallback =
-    extern "C" fn(proxy: CGEventTapProxy, etype: u32, event: CGEventRef, user_info: *mut c_void)
-        -> CGEventRef;
+type TapCallback = extern "C" fn(
+    proxy: CGEventTapProxy,
+    etype: u32,
+    event: CGEventRef,
+    user_info: *mut c_void,
+) -> CGEventRef;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -422,9 +425,7 @@ extern "C" fn cb_thunk(
     // Tap-disabled comes before everything else: the OS asks us to
     // re-enable the tap (it auto-disables on long callback latency or
     // explicit user input). Always pass through.
-    if etype == etypes::TAP_DISABLED_BY_TIMEOUT
-        || etype == etypes::TAP_DISABLED_BY_USER_INPUT
-    {
+    if etype == etypes::TAP_DISABLED_BY_TIMEOUT || etype == etypes::TAP_DISABLED_BY_USER_INPUT {
         if let Some(&mp) = state.port_holder.get() {
             // SAFETY: `mp` originated from a live `CFMachPort` owned by
             // the tap thread; it's still alive (we're inside its
