@@ -12,6 +12,7 @@ name = "kmwarp_core"
 path = "src/lib.rs"
 
 [dependencies]
+async-trait = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

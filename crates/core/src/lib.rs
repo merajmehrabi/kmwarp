@@ -5,6 +5,11 @@
 //! and implement the traits exposed here.
 
 pub mod error;
+pub mod platform;
+pub mod stuck_keys;
 pub mod wire;
 
 pub use error::{StateError, WireError};
+pub use platform::{
+    Clipboard, ClipboardEvent, InputSink, InputSource, KeyState, ModMask, MouseButton, SourceEvent,
+};
