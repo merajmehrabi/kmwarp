@@ -81,7 +81,10 @@ impl WinInputSink {
     pub fn new() -> Result<Self, DpiError> {
         dpi::set_per_monitor_dpi_aware()?;
         let (virtual_w, virtual_h) = dpi::virtual_screen_size();
-        Ok(Self { virtual_w, virtual_h })
+        Ok(Self {
+            virtual_w,
+            virtual_h,
+        })
     }
 
     /// Absolute cursor positioning across the virtual desktop, only used
@@ -225,23 +228,43 @@ fn button_flags(btn: MouseButton, state: KeyState) -> (MOUSE_EVENT_FLAGS, u32) {
     let down = matches!(state, KeyState::Down);
     match btn {
         MouseButton::Left => (
-            if down { MOUSEEVENTF_LEFTDOWN } else { MOUSEEVENTF_LEFTUP },
+            if down {
+                MOUSEEVENTF_LEFTDOWN
+            } else {
+                MOUSEEVENTF_LEFTUP
+            },
             0,
         ),
         MouseButton::Right => (
-            if down { MOUSEEVENTF_RIGHTDOWN } else { MOUSEEVENTF_RIGHTUP },
+            if down {
+                MOUSEEVENTF_RIGHTDOWN
+            } else {
+                MOUSEEVENTF_RIGHTUP
+            },
             0,
         ),
         MouseButton::Middle => (
-            if down { MOUSEEVENTF_MIDDLEDOWN } else { MOUSEEVENTF_MIDDLEUP },
+            if down {
+                MOUSEEVENTF_MIDDLEDOWN
+            } else {
+                MOUSEEVENTF_MIDDLEUP
+            },
             0,
         ),
         MouseButton::X1 => (
-            if down { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP },
+            if down {
+                MOUSEEVENTF_XDOWN
+            } else {
+                MOUSEEVENTF_XUP
+            },
             XBUTTON1_FLAG,
         ),
         MouseButton::X2 => (
-            if down { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP },
+            if down {
+                MOUSEEVENTF_XDOWN
+            } else {
+                MOUSEEVENTF_XUP
+            },
             XBUTTON2_FLAG,
         ),
     }

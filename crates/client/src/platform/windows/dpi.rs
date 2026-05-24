@@ -55,7 +55,12 @@ pub fn set_per_monitor_dpi_aware() -> Result<(), DpiError> {
 /// MOUSEEVENTF_VIRTUALDESK` expects.
 pub fn virtual_screen_size() -> (i32, i32) {
     // SAFETY: `GetSystemMetrics` is a pure read of a system constant.
-    unsafe { (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)) }
+    unsafe {
+        (
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    }
 }
 
 /// Primary-monitor size in physical pixels, `(width, height)`.
