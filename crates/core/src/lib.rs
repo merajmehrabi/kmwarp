@@ -5,5 +5,6 @@
 //! and implement the traits exposed here.
 
 pub mod error;
+pub mod wire;
 
 pub use error::{StateError, WireError};
