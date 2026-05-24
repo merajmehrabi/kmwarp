@@ -147,6 +147,24 @@ pub fn encode_frame(msg: &Message, buf: &mut BytesMut) -> Result<(), WireError> 
             buf.put_u8(*reason_code);
             tracing::trace!(reason_code, "encoded Bye");
         }
+        Message::EchoPing { ts_ns } => {
+            let _span = tracing::trace_span!("msg.EchoPing").entered();
+            let payload_len: u16 = 8;
+            buf.reserve(FRAME_HEADER_LEN + payload_len as usize);
+            buf.put_u8(msg_type::ECHO_PING);
+            buf.put_u16_le(payload_len);
+            buf.put_u64_le(*ts_ns);
+            tracing::trace!(ts_ns, "encoded EchoPing");
+        }
+        Message::EchoPong { ts_ns } => {
+            let _span = tracing::trace_span!("msg.EchoPong").entered();
+            let payload_len: u16 = 8;
+            buf.reserve(FRAME_HEADER_LEN + payload_len as usize);
+            buf.put_u8(msg_type::ECHO_PONG);
+            buf.put_u16_le(payload_len);
+            buf.put_u64_le(*ts_ns);
+            tracing::trace!(ts_ns, "encoded EchoPong");
+        }
     }
     Ok(())
 }
@@ -281,6 +299,18 @@ fn decode_payload(msg_type_byte: u8, payload: &[u8]) -> Result<Message, WireErro
             tracing::trace!(reason_code, "decoded Bye");
             Ok(Message::Bye { reason_code })
         }
+        msg_type::ECHO_PING => {
+            let _span = tracing::trace_span!("msg.EchoPing").entered();
+            let ts_ns = r.read_u64_le()?;
+            tracing::trace!(ts_ns, "decoded EchoPing");
+            Ok(Message::EchoPing { ts_ns })
+        }
+        msg_type::ECHO_PONG => {
+            let _span = tracing::trace_span!("msg.EchoPong").entered();
+            let ts_ns = r.read_u64_le()?;
+            tracing::trace!(ts_ns, "decoded EchoPong");
+            Ok(Message::EchoPong { ts_ns })
+        }
         unknown => Err(WireError::UnknownMsgType(unknown)),
     }
 }
@@ -335,6 +365,13 @@ impl<'a> PayloadReader<'a> {
     fn read_u32_le(&mut self) -> Result<u32, WireError> {
         let bytes = self.read_bytes(4)?;
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_u64_le(&mut self) -> Result<u64, WireError> {
+        let bytes = self.read_bytes(8)?;
+        Ok(u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
     }
 
     fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], WireError> {

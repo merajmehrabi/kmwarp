@@ -75,6 +75,11 @@ fn all_variants() -> Vec<Message> {
         Message::Heartbeat { seq: u32::MAX },
         Message::Bye { reason_code: 0 },
         Message::Bye { reason_code: 0xFE },
+        Message::EchoPing { ts_ns: 0 },
+        Message::EchoPing { ts_ns: u64::MAX },
+        Message::EchoPong {
+            ts_ns: 1_234_567_890,
+        },
     ]
 }
 
@@ -231,5 +236,29 @@ proptest! {
             .expect("decode ok")
             .expect("frame");
         prop_assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn echo_ping_roundtrips_for_any_u64(ts_ns in any::<u64>()) {
+        let original = Message::EchoPing { ts_ns };
+        let mut buf = BytesMut::new();
+        encode_frame(&original, &mut buf).expect("encode succeeds");
+        let decoded = decode_frame(&mut buf)
+            .expect("decode ok")
+            .expect("frame");
+        prop_assert_eq!(decoded, original);
+        prop_assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn echo_pong_roundtrips_for_any_u64(ts_ns in any::<u64>()) {
+        let original = Message::EchoPong { ts_ns };
+        let mut buf = BytesMut::new();
+        encode_frame(&original, &mut buf).expect("encode succeeds");
+        let decoded = decode_frame(&mut buf)
+            .expect("decode ok")
+            .expect("frame");
+        prop_assert_eq!(decoded, original);
+        prop_assert!(buf.is_empty());
     }
 }

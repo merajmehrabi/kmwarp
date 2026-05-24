@@ -13,8 +13,13 @@
 //! arms rather than touching the enum shape.
 
 pub mod codec;
+pub mod convert;
 
 pub use codec::{decode_frame, encode_frame};
+pub use convert::{
+    apply_mouse_to_sink, byte_to_key_state, byte_to_mouse_button, key_state_to_byte,
+    mouse_button_to_byte, source_event_to_message,
+};
 
 /// Wire protocol version negotiated in `Hello` / `HelloAck`.
 pub const PROTO_VERSION: u16 = 1;
@@ -26,6 +31,11 @@ pub const MAX_PAYLOAD_LEN: u16 = u16::MAX;
 pub const FRAME_HEADER_LEN: usize = 3;
 
 /// `msg_type` byte assignments straight from the spec table.
+///
+/// `ECHO_PING` / `ECHO_PONG` are out-of-spec, allocated from the unused
+/// `0x70` range for the M4 latency-probe harness. Carried in the wire
+/// enum unconditionally so a `latency-probe`-enabled server can talk to a
+/// stock client (and vice versa) without protocol version skew.
 pub mod msg_type {
     pub const HELLO: u8 = 0x01;
     pub const HELLO_ACK: u8 = 0x02;
@@ -36,8 +46,30 @@ pub mod msg_type {
     pub const CLIPBOARD_TEXT: u8 = 0x30;
     pub const TAKE_CONTROL: u8 = 0x40;
     pub const RELEASE_CONTROL: u8 = 0x41;
+    pub const ECHO_PING: u8 = 0x70;
+    pub const ECHO_PONG: u8 = 0x71;
     pub const HEARTBEAT: u8 = 0xFE;
     pub const BYE: u8 = 0xFF;
+}
+
+/// Wire-protocol convention for the `MouseButton.button` byte.
+///
+/// The spec table only specifies the field is a `u8`; we pin the mapping
+/// here so the server and client encode/decode against the same dictionary.
+pub mod mouse_button_code {
+    pub const LEFT: u8 = 0;
+    pub const RIGHT: u8 = 1;
+    pub const MIDDLE: u8 = 2;
+    pub const X1: u8 = 3;
+    pub const X2: u8 = 4;
+}
+
+/// Wire-protocol convention for any `state` byte (mouse button / key).
+///
+/// Matches the spec table for `MouseButton` (`0 = up, 1 = down`).
+pub mod key_state_code {
+    pub const UP: u8 = 0;
+    pub const DOWN: u8 = 1;
 }
 
 /// Every protocol message the v1 wire format can carry.
@@ -92,4 +124,13 @@ pub enum Message {
 
     /// Graceful shutdown signal.
     Bye { reason_code: u8 },
+
+    /// Debug-only latency probe (M4 §latency-probe). `ts_ns` is opaque to
+    /// the receiver — it's the prober's monotonic clock reading; the
+    /// receiver simply echoes it back in an `EchoPong`.
+    EchoPing { ts_ns: u64 },
+
+    /// Reply to `EchoPing`. `ts_ns` is verbatim from the matching ping; the
+    /// prober subtracts it from its current clock reading to compute RTT.
+    EchoPong { ts_ns: u64 },
 }
