@@ -309,9 +309,19 @@ async fn handle_peer(
     )
     .await;
 
+    // M8 clipboard sync (macOS only). Install the NSPasteboard watcher;
+    // if it fails we log and continue — the peer session is still
+    // useful without clipboard sync. Returns:
+    //   - `clip_in_tx`: incoming-frame channel into which reader_task
+    //     pushes `Message::ClipboardText` for reassembly + local write;
+    //   - `echo_guard`: shared SHA-256 guard so the post-write watcher
+    //     event doesn't bounce back to the peer.
+    #[cfg(target_os = "macos")]
+    let (clip_in_tx, echo_guard) = spawn_clipboard_tasks(&mut set, remote, tx_out.clone()).await;
+
     // Reader: decode + dispatch. Pulses notify on every successful read,
-    // routes EchoPing → EchoPong, ReleaseControl → brain, optionally
-    // records EchoPong RTT.
+    // routes EchoPing → EchoPong, ReleaseControl → brain,
+    // ClipboardText → clipboard_in_task, optionally records EchoPong RTT.
     set.spawn(reader_task(
         remote,
         reader,
@@ -319,6 +329,8 @@ async fn handle_peer(
         tx_out.clone(),
         #[cfg(target_os = "macos")]
         brain_tx.clone(),
+        #[cfg(target_os = "macos")]
+        clip_in_tx.clone(),
         Arc::clone(&start),
         #[cfg(feature = "latency-probe")]
         Arc::clone(&latency_state),
@@ -336,13 +348,15 @@ async fn handle_peer(
         Arc::clone(&latency_state),
     ));
 
-    // Drop the brain channel sender so brain can shut down cleanly
-    // when the source forwarder exits. tx_out is intentionally kept
-    // alive in *this* scope so the post-disconnect M7 drain can still
-    // push synthesized `KeyEvent { Up }` releases into the encoder
-    // before we abort siblings.
+    // Drop the brain + clipboard-in channel senders so those tasks can
+    // shut down cleanly when their producers exit. tx_out is
+    // intentionally kept alive in *this* scope so the post-disconnect
+    // M7 drain can still push synthesized `KeyEvent { Up }` releases
+    // into the encoder before we abort siblings.
     #[cfg(target_os = "macos")]
     drop(brain_tx);
+    #[cfg(target_os = "macos")]
+    drop(clip_in_tx);
 
     // Wait for the first task to exit, then run the M7 graceful-
     // disconnect drain: synthesize Up events for every key still held
@@ -354,6 +368,14 @@ async fn handle_peer(
     let first_exit = wait_for_first_exit(remote, &mut set).await;
     #[cfg(target_os = "macos")]
     drain_held_on_disconnect(remote, &tx_out, &held).await;
+    // M8: clear the echo guard so a legitimate post-reconnect local copy
+    // isn't suppressed by a stale hash from before disconnect.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(g) = echo_guard.as_ref() {
+            g.lock().await.clear();
+        }
+    }
     drop(tx_out);
     drain_remaining_tasks(remote, set).await;
     debug!(peer = %remote, ?first_exit, "handle_peer exiting");
@@ -401,6 +423,10 @@ fn exit_kind(exit: &TaskExit) -> TaskExit {
         TaskExit::SourceForwarderFailed(s) => TaskExit::SourceForwarderFailed(s.clone()),
         #[cfg(target_os = "macos")]
         TaskExit::EdgeBrainFailed(s) => TaskExit::EdgeBrainFailed(s.clone()),
+        #[cfg(target_os = "macos")]
+        TaskExit::ClipboardOutFailed(s) => TaskExit::ClipboardOutFailed(s.clone()),
+        #[cfg(target_os = "macos")]
+        TaskExit::ClipboardInFailed(s) => TaskExit::ClipboardInFailed(s.clone()),
         #[cfg(feature = "latency-probe")]
         TaskExit::LatencyProberFailed(s) => TaskExit::LatencyProberFailed(s.clone()),
         TaskExit::JoinError => TaskExit::JoinError,
@@ -508,6 +534,13 @@ enum TaskExit {
     /// Edge brain exited — typically because the brain channel closed.
     #[cfg(target_os = "macos")]
     EdgeBrainFailed(String),
+    /// Clipboard outbound watcher exited — the NSPasteboard watcher
+    /// thread sent EOF or the outbound channel closed.
+    #[cfg(target_os = "macos")]
+    ClipboardOutFailed(String),
+    /// Clipboard inbound reassembler exited — its frame channel closed.
+    #[cfg(target_os = "macos")]
+    ClipboardInFailed(String),
     #[cfg(feature = "latency-probe")]
     LatencyProberFailed(String),
     JoinError,
@@ -538,6 +571,14 @@ fn log_exit(remote: SocketAddr, exit: TaskExit) {
         #[cfg(target_os = "macos")]
         TaskExit::EdgeBrainFailed(reason) => {
             warn!(peer = %remote, reason, "edge brain exited; tearing down")
+        }
+        #[cfg(target_os = "macos")]
+        TaskExit::ClipboardOutFailed(reason) => {
+            warn!(peer = %remote, reason, "clipboard outbound exited; tearing down")
+        }
+        #[cfg(target_os = "macos")]
+        TaskExit::ClipboardInFailed(reason) => {
+            warn!(peer = %remote, reason, "clipboard inbound exited; tearing down")
         }
         #[cfg(feature = "latency-probe")]
         TaskExit::LatencyProberFailed(reason) => {
@@ -599,6 +640,7 @@ async fn reader_task(
     notify: Arc<Notify>,
     tx_out: mpsc::Sender<Message>,
     #[cfg(target_os = "macos")] brain_tx: Option<mpsc::Sender<BrainInput>>,
+    #[cfg(target_os = "macos")] clip_in_tx: Option<mpsc::Sender<Message>>,
     start: Arc<Instant>,
     #[cfg(feature = "latency-probe")] latency: Arc<LatencyState>,
 ) -> TaskExit {
@@ -650,9 +692,28 @@ async fn reader_task(
                             );
                         }
                     }
-                    // Heartbeat / Mouse / Key / Clipboard / TakeControl
-                    // from the client: deadline reset is the only handling
-                    // needed today. M8 will react to ClipboardText.
+                    #[cfg(target_os = "macos")]
+                    ref m @ Message::ClipboardText { ref bytes, .. } => {
+                        if let Some(ref ct) = clip_in_tx {
+                            if let Err(e) = ct.try_send(m.clone()) {
+                                warn!(
+                                    peer = %remote,
+                                    error = ?e,
+                                    chunk_len = bytes.len(),
+                                    "failed to enqueue ClipboardText into clipboard_in_task"
+                                );
+                            }
+                        } else {
+                            trace!(
+                                peer = %remote,
+                                chunk_len = bytes.len(),
+                                "ClipboardText received but no clipboard task (install failed?)"
+                            );
+                        }
+                    }
+                    // Heartbeat / Mouse / Key / TakeControl from the
+                    // client: deadline reset is the only handling
+                    // needed today.
                     _ => {}
                 }
                 // start is read on the latency-probe path; mark it unused
@@ -1023,6 +1084,185 @@ fn enqueue(remote: SocketAddr, tx_out: &mpsc::Sender<Message>, msg: Message) {
             debug!(peer = %remote, "outbound closed; action enqueue dropped");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// M8 clipboard sync
+// ---------------------------------------------------------------------------
+
+/// Per-peer clipboard sync bound: incoming `Message::ClipboardText`
+/// frames are queued from reader_task into the inbound reassembler
+/// task. Small bound: chunks arrive at human-clipboard rate, not
+/// keyboard rate.
+#[cfg(target_os = "macos")]
+const CLIPBOARD_IN_CHANNEL_BOUND: usize = 64;
+
+/// Install the NSPasteboard watcher and spawn the two clipboard
+/// tasks (outbound watcher → wire, inbound wire → local pasteboard).
+///
+/// Returns `(clip_in_tx, echo_guard)` even when the install fails:
+///   - `clip_in_tx` is `None` if the install failed (reader_task will
+///     drop incoming `ClipboardText` frames rather than panic).
+///   - `echo_guard` is `None` in the same case (the disconnect-clear
+///     path skips its `.lock().clear()`).
+///
+/// Returning a tuple of `Option<Sender>` + `Option<Arc<...>>` rather
+/// than failing the whole peer session matches the rest of the M2/M4
+/// fallback pattern: input forwarding can keep running without
+/// clipboard sync; the peer session is still useful.
+#[cfg(target_os = "macos")]
+async fn spawn_clipboard_tasks(
+    set: &mut JoinSet<TaskExit>,
+    remote: SocketAddr,
+    tx_out: mpsc::Sender<Message>,
+) -> (
+    Option<mpsc::Sender<Message>>,
+    Option<std::sync::Arc<tokio::sync::Mutex<kmwarp_core::clipboard::EchoGuard>>>,
+) {
+    use crate::platform::macos::clipboard::NsPasteboardClipboard;
+
+    // Install is synchronous (just spawns a thread); no spawn_blocking
+    // needed. Wrap in spawn_blocking anyway for symmetry with the M2
+    // tap install, which DOES block.
+    let install_result = tokio::task::spawn_blocking(NsPasteboardClipboard::install).await;
+    let clipboard = match install_result {
+        Ok(Ok(c)) => {
+            info!(peer = %remote, "NSPasteboard watcher installed; M8 clipboard sync online");
+            c
+        }
+        Ok(Err(e)) => {
+            warn!(
+                peer = %remote,
+                error = %e,
+                "failed to install NSPasteboard watcher; continuing without clipboard sync"
+            );
+            return (None, None);
+        }
+        Err(e) => {
+            error!(peer = %remote, error = %e, "spawn_blocking for clipboard install panicked");
+            return (None, None);
+        }
+    };
+
+    let echo_guard = std::sync::Arc::new(tokio::sync::Mutex::new(
+        kmwarp_core::clipboard::EchoGuard::new(),
+    ));
+    let (clip_in_tx, clip_in_rx) = mpsc::channel::<Message>(CLIPBOARD_IN_CHANNEL_BOUND);
+
+    set.spawn(clipboard_out_task(
+        remote,
+        clipboard,
+        std::sync::Arc::clone(&echo_guard),
+        tx_out,
+    ));
+    set.spawn(clipboard_in_task(
+        remote,
+        clip_in_rx,
+        std::sync::Arc::clone(&echo_guard),
+    ));
+
+    (Some(clip_in_tx), Some(echo_guard))
+}
+
+/// Outbound clipboard task: drain `clipboard.next_change()` and split
+/// each text into wire `Message::ClipboardText` frames via
+/// `Chunker::split`. Pre-filtered against `EchoGuard` so a change we
+/// just wrote in response to a remote frame doesn't bounce back.
+#[cfg(target_os = "macos")]
+async fn clipboard_out_task(
+    remote: SocketAddr,
+    mut clipboard: crate::platform::macos::clipboard::NsPasteboardClipboard,
+    echo_guard: std::sync::Arc<tokio::sync::Mutex<kmwarp_core::clipboard::EchoGuard>>,
+    tx_out: mpsc::Sender<Message>,
+) -> TaskExit {
+    use kmwarp_core::clipboard::Chunker;
+    use kmwarp_core::platform::{Clipboard, ClipboardEvent};
+
+    loop {
+        let ev = match clipboard.next_change().await {
+            Some(e) => e,
+            None => {
+                return TaskExit::ClipboardOutFailed("NSPasteboard watcher channel closed".into())
+            }
+        };
+        let ClipboardEvent::TextChanged(text) = ev;
+        // SHA-256 echo guard: suppress changes that match the last
+        // text we wrote in response to a remote frame.
+        if echo_guard.lock().await.is_echo_of_remote(&text) {
+            trace!(
+                peer = %remote,
+                len = text.len(),
+                "suppressing clipboard change matching last remote write"
+            );
+            continue;
+        }
+        let chunks = Chunker::split(&text);
+        debug!(
+            peer = %remote,
+            len = text.len(),
+            chunks = chunks.len(),
+            "forwarding clipboard change to peer"
+        );
+        for msg in chunks {
+            match tx_out.try_send(msg) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        peer = %remote,
+                        "outbound full; dropping ClipboardText chunk (peer may see truncated paste)"
+                    );
+                    // Don't try to send remaining chunks — they'd be a
+                    // dangling tail with no FIRST flag.
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return TaskExit::ClipboardOutFailed("outbound channel closed".into())
+                }
+            }
+        }
+    }
+}
+
+/// Inbound clipboard task: feed `Message::ClipboardText` frames from
+/// reader_task into a `Reassembler`. On a complete payload, write to
+/// `NSPasteboard` and register the SHA-256 in the echo guard so the
+/// next watcher tick doesn't re-forward what we just wrote.
+#[cfg(target_os = "macos")]
+async fn clipboard_in_task(
+    remote: SocketAddr,
+    mut clip_in_rx: mpsc::Receiver<Message>,
+    echo_guard: std::sync::Arc<tokio::sync::Mutex<kmwarp_core::clipboard::EchoGuard>>,
+) -> TaskExit {
+    use crate::platform::macos::clipboard::pasteboard_write;
+    use kmwarp_core::clipboard::Reassembler;
+
+    let mut reassembler = Reassembler::new();
+    while let Some(msg) = clip_in_rx.recv().await {
+        match reassembler.ingest(&msg) {
+            Ok(Some(text)) => {
+                debug!(peer = %remote, len = text.len(), "writing peer clipboard to NSPasteboard");
+                // Order: register the hash FIRST, then write — the
+                // watcher could fire between the two calls, and we
+                // don't want to forward our own write to the peer.
+                echo_guard.lock().await.remember_remote_write(&text);
+                // pasteboard_write is fast (~µs) but not async; this
+                // is fine because clipboard frames arrive at human
+                // rate. If we ever need to free the runtime worker we
+                // can spawn_blocking it.
+                pasteboard_write(&text);
+            }
+            Ok(None) => {
+                // Mid-stream chunk; keep collecting.
+                trace!(peer = %remote, "clipboard chunk accumulated");
+            }
+            Err(e) => {
+                warn!(peer = %remote, error = %e, "clipboard reassembly failed; resetting");
+                // Reassembler resets its own buffer on FIRST flag; an
+                // explicit reset isn't needed.
+            }
+        }
+    }
+    TaskExit::ClipboardInFailed("clipboard in channel closed".into())
 }
 
 // ---------------------------------------------------------------------------
