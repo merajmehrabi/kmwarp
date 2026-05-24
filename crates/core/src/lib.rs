@@ -4,6 +4,7 @@
 //! (`kmwarp-server`) and Windows client (`kmwarp-client`) bring those in
 //! and implement the traits exposed here.
 
+pub mod clipboard;
 pub mod config;
 pub mod edge;
 pub mod error;
@@ -13,6 +14,7 @@ pub mod platform;
 pub mod stuck_keys;
 pub mod wire;
 
+pub use clipboard::{ChunkFlags, Chunker, EchoGuard, ReassembleError, Reassembler};
 pub use error::{ConfigError, StateError, WireError};
 pub use platform::{
     Clipboard, ClipboardEvent, InputSink, InputSource, KeyState, ModMask, MouseButton, SourceEvent,

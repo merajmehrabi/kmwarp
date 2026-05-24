@@ -28,6 +28,9 @@ async-trait = "0.1"
 # Small inline-allocated vectors (used by core::edge state machine output)
 smallvec = "1"
 
+# Bitflag-style enums (used by core::clipboard::ChunkFlags)
+bitflags = "2"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
