@@ -8,6 +8,7 @@ pub mod config;
 pub mod edge;
 pub mod error;
 pub mod hid;
+pub mod modmap;
 pub mod platform;
 pub mod stuck_keys;
 pub mod wire;

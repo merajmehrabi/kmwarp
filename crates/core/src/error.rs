@@ -47,12 +47,21 @@ pub enum WireError {
 #[derive(Debug, Error)]
 pub enum StateError {}
 
-/// Errors from `[modifiers]` and friends in `~/.config/kmwarp/config.toml`.
+/// Errors from `~/.config/kmwarp/config.toml` parsing and loading.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    /// Underlying TOML parse failure; carries the human-readable message
-    /// from the `toml` crate so the binary `fn main()` can surface it
-    /// verbatim.
+    /// Filesystem error reading the config file.
+    #[error("config IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// TOML parse failure. Carries the upstream error so the binary's
+    /// `fn main()` can surface its rich span info verbatim.
     #[error("config parse error: {0}")]
-    Parse(String),
+    Parse(#[from] toml::de::Error),
+
+    /// `directories` couldn't resolve a home directory on this
+    /// platform — rare, but happens in sandboxed contexts without
+    /// `$HOME`.
+    #[error("could not resolve OS-conventional config directory")]
+    MissingDir,
 }
