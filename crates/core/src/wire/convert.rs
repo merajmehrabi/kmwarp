@@ -12,7 +12,7 @@
 //! converting its native units to/from this convention; the helpers here
 //! are byte-pure (i.e. they do not do unit conversion).
 
-use crate::config::ModRemap;
+use crate::modmap::ModRemap;
 use crate::platform::{InputSink, KeyState, ModMask, MouseButton, SourceEvent};
 use crate::wire::{key_state_code, mouse_button_code, Message};
 
@@ -92,12 +92,15 @@ pub fn source_event_to_message(ev: SourceEvent) -> Option<Message> {
 }
 
 /// Like [`source_event_to_message`] but applies a [`ModRemap`] to the
-/// modifier byte of `SourceEvent::Key` events. Mouse / wheel / button
-/// variants pass through unchanged.
+/// HID code **and** the `mods` byte of `SourceEvent::Key` events.
+/// Mouse / wheel / button variants pass through unchanged.
 ///
 /// This is the M7 hook the server runtime should call from its
-/// RemoteActive forwarding path so Cmd+C on the Mac arrives as Ctrl+C
-/// on the wire.
+/// RemoteActive forwarding path. With default remap (`cmd → Ctrl`):
+/// - Pressing the Cmd key emits a wire `KeyEvent { hid: LCtrl, mods: 0 }`
+///   (HID-level remap so the receiver sees a Ctrl press, not a Win press).
+/// - Pressing `C` while holding Cmd emits `KeyEvent { hid: C, mods: CTRL }`
+///   (chord-level remap on the `mods` byte).
 pub fn source_event_to_message_remapped(ev: SourceEvent, remap: &ModRemap) -> Option<Message> {
     match ev {
         SourceEvent::Key {
@@ -105,9 +108,9 @@ pub fn source_event_to_message_remapped(ev: SourceEvent, remap: &ModRemap) -> Op
             state,
             mods,
         } => Some(Message::KeyEvent {
-            hid_usage,
+            hid_usage: remap.apply_to_hid(hid_usage),
             state: key_state_to_byte(state),
-            modifiers: remap.apply(mods).to_wire(),
+            modifiers: remap.apply_to_modmask(mods).to_wire(),
         }),
         // Non-key events are unaffected by modifier remap; delegate.
         other => source_event_to_message(other),

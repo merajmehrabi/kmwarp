@@ -613,6 +613,7 @@ async fn edge_brain_task(
     swallow: std::sync::Arc<AtomicBool>,
     tx_out: mpsc::Sender<Message>,
     screen_w_px: u16,
+    held: std::sync::Arc<std::sync::Mutex<kmwarp_core::stuck_keys::HeldKeys>>,
 ) -> TaskExit {
     use kmwarp_core::edge::{EdgeConfig, StateMachine};
 
@@ -648,7 +649,7 @@ async fn edge_brain_task(
             }
         };
         for action in actions {
-            execute_action(remote, action, &mut sink, &tx_out, &swallow, &mod_remap);
+            execute_action(remote, action, &mut sink, &tx_out, &swallow, &mod_remap, &held);
         }
     }
     TaskExit::EdgeBrainFailed("brain input channel closed".into())
