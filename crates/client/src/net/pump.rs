@@ -29,6 +29,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use kmwarp_core::stuck_keys::HeldKeys;
 use kmwarp_core::wire::{apply_key_to_sink, apply_mouse_to_sink, key_state_code, Message};
 use kmwarp_core::{InputSink, KeyState, ModMask};
@@ -37,6 +38,21 @@ use tracing::{debug, info, trace, warn};
 
 use crate::error::ClientError;
 use crate::net::{FrameReader, FrameWriter};
+
+/// Abstract source of decoded frames. Production uses [`FrameReader`]
+/// (TCP-backed); the M7 integration test uses an in-memory queue so it
+/// can prove the stuck-key drain without touching sockets.
+#[async_trait]
+pub trait FrameSource: Send {
+    async fn next_frame(&mut self) -> Result<Message, ClientError>;
+}
+
+#[async_trait]
+impl FrameSource for FrameReader {
+    async fn next_frame(&mut self) -> Result<Message, ClientError> {
+        self.read_frame().await
+    }
+}
 
 /// Drain `rx` into `writer` until the channel closes or the socket dies.
 pub async fn encoder_loop(
@@ -129,19 +145,37 @@ pub(crate) fn track_key_in_held(msg: &Message, held: &mut HeldKeys) {
 /// Returns `Err` on socket / wire failure (treat as session-fatal); on a
 /// peer `Bye` it returns `Ok(())` for a clean session end.
 pub async fn injector_loop<S: InputSink + Send>(
-    mut reader: FrameReader,
+    reader: FrameReader,
     sink: S,
     notify: Arc<Notify>,
     tx_out: mpsc::Sender<Message>,
     active: Arc<AtomicBool>,
 ) -> Result<(), ClientError> {
+    injector_loop_with_source(reader, sink, notify, tx_out, active).await
+}
+
+/// Generic injector entry-point used by both production (with a
+/// [`FrameReader`]) and the M7 integration test (with an in-memory
+/// mock).
+///
+/// The `InjectorGuard` lives at this scope so the drain on cancellation
+/// holds for both call sites.
+pub async fn injector_loop_with_source<F, S>(
+    mut source: F,
+    sink: S,
+    notify: Arc<Notify>,
+    tx_out: mpsc::Sender<Message>,
+    active: Arc<AtomicBool>,
+) -> Result<(), ClientError>
+where
+    F: FrameSource,
+    S: InputSink + Send,
+{
     let mut guard = InjectorGuard::new(sink);
     loop {
-        let msg = reader.read_frame().await?;
+        let msg = source.next_frame().await?;
         notify.notify_one();
         dispatch_one(&msg, &mut guard, &tx_out, &active);
-        // The dispatch helper returns `Some(())` for "session done"
-        // (peer Bye). Use a tagged enum for clarity:
         if matches!(msg, Message::Bye { .. }) {
             return Ok(());
         }

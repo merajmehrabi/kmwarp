@@ -7,4 +7,4 @@ pub mod connection;
 pub mod pump;
 
 pub use connection::{Connection, FrameReader, FrameWriter};
-pub use pump::{encoder_loop, injector_loop};
+pub use pump::{encoder_loop, injector_loop, injector_loop_with_source, FrameSource};

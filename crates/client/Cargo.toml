@@ -15,6 +15,7 @@ path = "src/main.rs"
 kmwarp-core = { path = "../core" }
 
 tokio = { workspace = true }
+async-trait = { workspace = true }
 bytes = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
