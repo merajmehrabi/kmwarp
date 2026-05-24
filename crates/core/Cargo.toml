@@ -1,0 +1,22 @@
+[package]
+name = "kmwarp-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Platform-agnostic protocol, state machine, and traits for kmwarp"
+
+[lib]
+name = "kmwarp_core"
+path = "src/lib.rs"
+
+[dependencies]
+bytes = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1.41", features = ["macros", "rt", "test-util"] }
+proptest = { workspace = true }
