@@ -83,24 +83,39 @@ impl InputSink for MacInputSink {
     }
 
     fn hide_cursor(&mut self) {
-        // `CGDisplayHideCursor` increments an internal hide-count;
-        // matched 1:1 by `show_cursor` calls. The state machine's
-        // hide/show actions come in matched pairs (per spec §M6
-        // transitions) so the count stays balanced.
+        // Hide the visual cursor AND decouple it from physical mouse motion.
+        // Without `associate(false)`, hiding alone leaves the (invisible)
+        // cursor following the user's hand — so when control transfers to
+        // Windows, the Mac cursor still drifts and re-crosses the edge
+        // immediately. Per M6, RemoteActive means the cursor stays put.
         let main = CGDisplay::main();
         if let Err(e) = main.hide_cursor() {
             warn!(cg_error = e, "CGDisplayHideCursor failed");
+        }
+        if let Err(e) = CGDisplay::associate_mouse_and_mouse_cursor_position(false) {
+            warn!(
+                cg_error = e,
+                "CGAssociateMouseAndMouseCursorPosition(false) failed; cursor will drift"
+            );
         } else {
-            trace!("cursor hidden");
+            trace!("cursor hidden + decoupled from physical motion");
         }
     }
 
     fn show_cursor(&mut self) {
+        // Re-couple BEFORE showing so the cursor is responsive the instant
+        // it reappears. Order matters: associate(true) first, then unhide.
+        if let Err(e) = CGDisplay::associate_mouse_and_mouse_cursor_position(true) {
+            warn!(
+                cg_error = e,
+                "CGAssociateMouseAndMouseCursorPosition(true) failed; cursor may not respond"
+            );
+        }
         let main = CGDisplay::main();
         if let Err(e) = main.show_cursor() {
             warn!(cg_error = e, "CGDisplayShowCursor failed");
         } else {
-            trace!("cursor shown");
+            trace!("cursor re-coupled + shown");
         }
     }
 }
