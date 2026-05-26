@@ -149,7 +149,7 @@ fn listener_thread() {
 
     let wnd_class = WNDCLASSW {
         lpfnWndProc: Some(clipboard_wnd_proc),
-        hInstance: hinstance.into(),
+        hInstance: windows::Win32::Foundation::HINSTANCE(hinstance.0),
         lpszClassName: class_name,
         ..Default::default()
     };
@@ -175,9 +175,9 @@ fn listener_thread() {
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            HWND_MESSAGE,
             None,
-            Some(hinstance.into()),
+            windows::Win32::Foundation::HINSTANCE(hinstance.0),
             None,
         )
     } {
@@ -199,7 +199,7 @@ fn listener_thread() {
 
     let mut msg = MSG::default();
     // SAFETY: `GetMessageW` only fails on bad pointers; ours are valid.
-    while unsafe { GetMessageW(&mut msg, Some(hwnd), 0, 0) }.as_bool() {
+    while unsafe { GetMessageW(&mut msg, hwnd, 0, 0) }.as_bool() {
         unsafe {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -345,10 +345,10 @@ unsafe fn write_clipboard_text_locked(text: &str) -> Result<(), ClipboardError> 
     // SetClipboardData wants a HANDLE; HGLOBAL is a thin newtype around
     // a pointer in windows-rs, so wrap by value.
     let handle = HANDLE(hglobal.0);
-    if let Err(e) = SetClipboardData(CF_UNICODETEXT, Some(handle)) {
+    if let Err(e) = SetClipboardData(CF_UNICODETEXT, handle) {
         // On error WE still own the memory and must free it. On success
         // the system takes ownership.
-        let _ = windows::Win32::System::Memory::GlobalFree(Some(hglobal));
+        let _ = windows::Win32::Foundation::GlobalFree(hglobal);
         return Err(ClipboardError::Write(format!("SetClipboardData: {e}")));
     }
     Ok(())

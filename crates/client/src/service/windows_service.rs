@@ -305,7 +305,7 @@ fn spawn_user_session_helper_and_wait() -> Result<(), ServiceError> {
     // apps that read e.g. APPDATA.
     let mut env_block: *mut std::ffi::c_void = std::ptr::null_mut();
     // SAFETY: out-param + valid token.
-    if let Err(e) = unsafe { CreateEnvironmentBlock(&mut env_block, Some(primary_token), false) } {
+    if let Err(e) = unsafe { CreateEnvironmentBlock(&mut env_block, primary_token, false) } {
         unsafe {
             let _ = CloseHandle(primary_token);
         }
@@ -327,22 +327,20 @@ fn spawn_user_session_helper_and_wait() -> Result<(), ServiceError> {
         ..Default::default()
     };
     let mut process_info = PROCESS_INFORMATION::default();
-    let app_name: Option<PCWSTR> = None;
-    let cwd: Option<PCWSTR> = None;
 
     // SAFETY: all pointers live for the call; `cmdline_w` is mutable and
     // null-terminated as required.
     let create_result = unsafe {
         CreateProcessAsUserW(
-            Some(primary_token),
-            app_name,
-            Some(PWSTR(cmdline_w.as_mut_ptr())),
+            primary_token,
+            PCWSTR::null(),
+            PWSTR(cmdline_w.as_mut_ptr()),
             None,
             None,
             false,
             CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
             Some(env_block),
-            cwd,
+            PCWSTR::null(),
             &startup_info,
             &mut process_info,
         )
