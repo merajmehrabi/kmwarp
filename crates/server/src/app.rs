@@ -853,18 +853,105 @@ async fn deadline_watcher(remote: SocketAddr, notify: Arc<Notify>) -> TaskExit {
 #[cfg(target_os = "macos")]
 fn query_screen_px() -> (u16, u16) {
     use core_graphics::display::CGDisplay;
-    let main = CGDisplay::main();
-    // `pixels_wide` / `pixels_high` return `u64`; the wire field is u16
-    // (and HelloAck uses u16). Saturate at u16::MAX — anyone running
-    // a >65535-px wide display is outside v1's tested envelope.
-    let w = main.pixels_wide().min(u64::from(u16::MAX)) as u16;
-    let h = main.pixels_high().min(u64::from(u16::MAX)) as u16;
+    // CGEvent.location() reports cursor position in *logical points* in
+    // the GLOBAL coordinate space that spans every active display. The SM
+    // compares cursor.x against `local_screen_w` to detect right-edge
+    // crossings, so we need the rightmost logical x of the entire
+    // arrangement — not the main display's physical pixel width.
+    let mut max_right = 0.0_f64;
+    let mut max_bottom = 0.0_f64;
+    let mut any_found = false;
+    if let Ok(ids) = CGDisplay::active_displays() {
+        for id in ids {
+            let bounds = CGDisplay::new(id).bounds();
+            let right = bounds.origin.x + bounds.size.width;
+            let bottom = bounds.origin.y + bounds.size.height;
+            tracing::info!(
+                display_id = id,
+                origin_x = bounds.origin.x,
+                origin_y = bounds.origin.y,
+                width = bounds.size.width,
+                height = bounds.size.height,
+                "detected display"
+            );
+            if right > max_right {
+                max_right = right;
+            }
+            if bottom > max_bottom {
+                max_bottom = bottom;
+            }
+            any_found = true;
+        }
+    }
+    if !any_found {
+        let b = CGDisplay::main().bounds();
+        max_right = b.origin.x + b.size.width;
+        max_bottom = b.origin.y + b.size.height;
+    }
+    let w = max_right.max(1.0).min(f64::from(u16::MAX)) as u16;
+    let h = max_bottom.max(1.0).min(f64::from(u16::MAX)) as u16;
+    tracing::info!(
+        screen_w_logical = w,
+        screen_h_logical = h,
+        "resolved global display extent; right-edge crossing at x >= this w"
+    );
     (w, h)
 }
 
 #[cfg(not(target_os = "macos"))]
 fn query_screen_px() -> (u16, u16) {
     FALLBACK_SCREEN_PX
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DisplayRect {
+    origin_x: f64,
+    origin_y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl DisplayRect {
+    fn right(self) -> f64 {
+        self.origin_x + self.width
+    }
+    fn contains(self, x: i32, y: i32) -> bool {
+        let fx = f64::from(x);
+        let fy = f64::from(y);
+        fx >= self.origin_x
+            && fx < self.origin_x + self.width
+            && fy >= self.origin_y
+            && fy < self.origin_y + self.height
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn query_displays() -> Vec<DisplayRect> {
+    use core_graphics::display::CGDisplay;
+    let mut out = Vec::new();
+    if let Ok(ids) = CGDisplay::active_displays() {
+        for id in ids {
+            let b = CGDisplay::new(id).bounds();
+            out.push(DisplayRect {
+                origin_x: b.origin.x,
+                origin_y: b.origin.y,
+                width: b.size.width,
+                height: b.size.height,
+            });
+        }
+    }
+    out
+}
+
+#[cfg(not(target_os = "macos"))]
+fn query_displays() -> Vec<DisplayRect> {
+    Vec::new()
+}
+
+/// Find which display the cursor at (x, y) is on. Uses the same global
+/// logical-point coordinate space as `CGEvent.location()`.
+fn display_containing(displays: &[DisplayRect], x: i32, y: i32) -> Option<&DisplayRect> {
+    displays.iter().find(|d| d.contains(x, y))
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,12 +1088,60 @@ async fn edge_brain_task(
     let mut sm = StateMachine::new(cfg);
     let mut sink = crate::platform::macos::inject::MacInputSink::new();
 
+    // Snapshot display geometry once. Multi-monitor arrangements are
+    // stable during a session; if the user changes display layout
+    // mid-session, they reconnect. We use this to:
+    //   (a) detect when the cursor reaches the right edge of WHATEVER
+    //       display it's currently on (not just the global rightmost
+    //       edge — that could be on a monitor stacked above the main),
+    //   (b) on return, warp the cursor back to that same display's
+    //       right edge so it reappears where the user left from.
+    let displays = query_displays();
+    let global_right = i32::from(w);
+    let mut home_display_right: i32 = global_right;
+
     let epoch = Instant::now();
     debug!(peer = %remote, screen_w_px, "edge_brain online (LocalActive)");
 
     while let Some(input) = brain_rx.recv().await {
         let now_ms = epoch.elapsed().as_millis() as u64;
-        let actions = match input {
+
+        // Transform CursorAt so the SM's `x >= local_screen_w` rule fires
+        // when the cursor hits ANY display's right edge, not just the
+        // arrangement's global rightmost. We rewrite x to global_right
+        // when the cursor is at its containing display's right edge.
+        let sm_input = match input {
+            BrainInput::Source(kmwarp_core::platform::SourceEvent::CursorAt { x, y }) => {
+                if let Some(d) = display_containing(&displays, x, y) {
+                    let d_right = d.right() as i32;
+                    // macOS clamps cursor.x to d_right - 1 (display bounds
+                    // are half-open). "At the right edge" means within 1
+                    // px of d_right.
+                    if x >= d_right - 1 {
+                        home_display_right = d_right;
+                        BrainInput::Source(kmwarp_core::platform::SourceEvent::CursorAt {
+                            x: global_right,
+                            y,
+                        })
+                    } else {
+                        // Below the local-display right edge: explicitly
+                        // non-triggering. Send x=0 so the SM's threshold
+                        // check definitely doesn't fire.
+                        BrainInput::Source(kmwarp_core::platform::SourceEvent::CursorAt {
+                            x: 0,
+                            y,
+                        })
+                    }
+                } else {
+                    // Cursor outside any known display (in-flight during
+                    // arrangement change?). Pass through unchanged.
+                    BrainInput::Source(kmwarp_core::platform::SourceEvent::CursorAt { x, y })
+                }
+            }
+            other => other,
+        };
+
+        let actions = match sm_input {
             BrainInput::Source(ev) => sm.on_local_event(ev, now_ms),
             BrainInput::WireMessage(msg) => {
                 if matches!(msg, Message::ReleaseControl { .. }) {
@@ -1016,6 +1151,20 @@ async fn edge_brain_task(
             }
         };
         for action in actions {
+            // Rewrite WarpLocalCursor's x so the back-warp (after
+            // crossing) and the return-warp (after ReleaseControl) both
+            // land on the display the user "came from", not on whatever
+            // display happens to own global_right.
+            let action = match action {
+                kmwarp_core::edge::Action::WarpLocalCursor { x: sm_x, y } => {
+                    let offset = global_right - sm_x; // 1 for return, back_warp_px for entry
+                    kmwarp_core::edge::Action::WarpLocalCursor {
+                        x: home_display_right - offset,
+                        y,
+                    }
+                }
+                other => other,
+            };
             execute_action(
                 remote, action, &mut sink, &tx_out, &swallow, &mod_remap, &held,
             );
