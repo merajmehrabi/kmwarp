@@ -323,7 +323,14 @@ pub(crate) fn dispatch_one<S: InputSink>(
         }
         Message::TakeControl { entry_y } => {
             info!(entry_y, "received TakeControl; activating");
-            guard.sink_mut().warp_cursor_abs(0, i32::from(*entry_y));
+            // Warp 40px IN from the left edge, not exactly at x=0. If we land
+            // on x=0 the cursor_watch's next 16ms tick reads pos.x <= 0 and
+            // bounces an immediate ReleaseControl back — which the server's
+            // 50ms thrash cooldown drops, stranding us in RemoteActive forever.
+            const TAKE_ENTRY_INSET_PX: i32 = 40;
+            guard
+                .sink_mut()
+                .warp_cursor_abs(TAKE_ENTRY_INSET_PX, i32::from(*entry_y));
             active.store(true, Ordering::Relaxed);
         }
         Message::ReleaseControl { .. } => {

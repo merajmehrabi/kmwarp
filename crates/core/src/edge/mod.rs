@@ -242,12 +242,16 @@ impl StateMachine {
             if self.state != State::RemoteActive {
                 return actions;
             }
-            if !self.cooldown_elapsed(now_ms) {
-                return actions;
-            }
+            // NOTE: cooldown intentionally NOT applied here. The cooldown
+            // only protects against rapid L→R bouncing on the Mac edge
+            // (where the user's hand at the edge could rapid-fire CursorAt
+            // events). R→L is peer-initiated by an explicit ReleaseControl,
+            // sent at most once per cursor_watch leave-detection. Dropping
+            // it would strand the SM in RemoteActive forever — the
+            // cursor_watch already disabled itself after sending, so no
+            // retry will come.
             // Spec: warp local cursor to `local_screen_w - 1` so the
-            // visual handoff is continuous; cooldown blocks immediate
-            // re-crossing.
+            // visual handoff is continuous.
             let edge_x = (self.cfg.local_screen_w as i32).saturating_sub(1);
             actions.push(Action::StopSwallow);
             actions.push(Action::ShowLocalCursor);

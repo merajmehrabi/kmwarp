@@ -234,26 +234,24 @@ fn thrash_cooldown_blocks_rapid_transitions() {
     );
     assert_eq!(sm.state(), State::RemoteActive);
 
-    // Release at t=120 — only 20 ms gap, within the 50 ms cooldown.
-    // Should be dropped silently.
+    // Release at t=120 — only 20 ms gap. R→L is peer-initiated by an
+    // explicit ReleaseControl (cursor_watch fires once then disables
+    // itself), so it must ALWAYS land — dropping it would strand the SM
+    // in RemoteActive forever. Cooldown intentionally does NOT block this
+    // direction.
     let actions = wire(&mut sm, Message::ReleaseControl { exit_y: 100 }, 120);
-    assert!(actions.is_empty(), "release within cooldown is dropped");
-    assert_eq!(sm.state(), State::RemoteActive);
-
-    // At t=200 (100 ms after the entry transition), well past cooldown.
-    let actions = wire(&mut sm, Message::ReleaseControl { exit_y: 100 }, 200);
-    assert!(!actions.is_empty(), "release after cooldown lands");
+    assert!(!actions.is_empty(), "release lands regardless of cooldown");
     assert_eq!(sm.state(), State::LocalActive);
 
-    // Same idea on the LocalActive → RemoteActive direction: within
-    // 50 ms of the release we just did, a crossing is ignored.
+    // Now back in LocalActive at t=120. The L→R cooldown still applies:
+    // within 50 ms of the release, a crossing is ignored.
     let actions = local(
         &mut sm,
         SourceEvent::CursorAt {
             x: cfg.local_screen_w as i32 + 1,
             y: 0,
         },
-        240,
+        140,
     );
     assert!(actions.is_empty(), "cross within cooldown is ignored");
     assert_eq!(sm.state(), State::LocalActive);
@@ -467,12 +465,22 @@ fn custom_config_is_honored() {
         Action::WarpLocalCursor { x: 2550, y: 50 }
     ));
 
-    // 100 ms cooldown — release at +99 ms is dropped.
-    let release_at_99 = wire(&mut sm, Message::ReleaseControl { exit_y: 0 }, 199);
-    assert!(release_at_99.is_empty());
-
-    // +101 ms passes.
-    let release_at_101 = wire(&mut sm, Message::ReleaseControl { exit_y: 0 }, 201);
-    assert!(!release_at_101.is_empty());
+    // Release always lands (R→L is not cooldown-gated). Sanity-check that
+    // the WarpLocalCursor uses the wider screen's edge_x = 2559.
+    let release_actions = wire(&mut sm, Message::ReleaseControl { exit_y: 77 }, 199);
+    assert!(release_actions.iter().any(|a| matches!(
+        a,
+        Action::WarpLocalCursor { x: 2559, y: 77 }
+    )));
     assert_eq!(sm.state(), State::LocalActive);
+
+    // The L→R cooldown still applies — re-crossing within 100 ms is blocked.
+    let blocked = local(&mut sm, SourceEvent::CursorAt { x: 2560, y: 50 }, 250);
+    assert!(blocked.is_empty(), "cross within 100ms cooldown is blocked");
+    assert_eq!(sm.state(), State::LocalActive);
+
+    // After cooldown clears, re-cross works.
+    let after = local(&mut sm, SourceEvent::CursorAt { x: 2560, y: 50 }, 350);
+    assert!(!after.is_empty());
+    assert_eq!(sm.state(), State::RemoteActive);
 }
