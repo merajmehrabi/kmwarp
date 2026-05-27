@@ -43,8 +43,7 @@
 
         <Property Id='ARPHELPLINK' Value='https://github.com/merajmehrabi/kmwarp'/>
         <Property Id='ARPURLINFOABOUT' Value='https://github.com/merajmehrabi/kmwarp'/>
-        <Property Id='ARPNOREPAIR' Value='yes' Secure='yes'/>
-        <Property Id='ARPNOMODIFY' Value='yes' Secure='yes'/>
+        <!-- ARPNOMODIFY / ARPNOREPAIR are defined by WixUI_Minimal; don't redeclare. -->
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <Directory Id='ProgramFiles64Folder'>
