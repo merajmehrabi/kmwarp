@@ -9,26 +9,23 @@ peers on the same LAN, encrypted transport (TLS + SPAKE2 pairing).
 See `kmwarp-SPEC.md` for the full spec, `PLAN.md` for the milestone
 breakdown, and `IDEAS.md` for v1.1+ follow-ups.
 
-## Build
-
-Requires Rust 1.82+ on macOS (server) and Windows (client). The
-workspace is portable; only the platform-specific crates are
-cfg-gated.
-
-```sh
-cargo build --release --workspace
-```
-
-The macOS server binary lands at `target/release/kmwarp-server`,
-the Windows client at `target/release/kmwarp-client.exe`.
-
 ## Install (macOS server)
 
-Once you have a binary, install it as a user LaunchAgent so it
-starts at login and survives crashes / Wi-Fi blips:
+Download the latest macOS server tarball from the
+[Releases page](https://github.com/merajmehrabi/kmwarp/releases/latest)
+and unpack it somewhere on your `$PATH` (or anywhere — the
+`install` subcommand below records the binary's absolute path):
 
 ```sh
-target/release/kmwarp-server install
+tar xzf kmwarp-server-vX.Y.Z-aarch64-apple-darwin.tar.gz
+mv kmwarp-server /usr/local/bin/   # or wherever you prefer
+```
+
+Then install it as a user LaunchAgent so it starts at login and
+survives crashes / Wi-Fi blips:
+
+```sh
+kmwarp-server install
 ```
 
 This:
@@ -52,45 +49,93 @@ After install:
    tail -f /tmp/kmwarp-server.log /tmp/kmwarp-server.err
    ```
 3. First connect from the Windows client triggers the SPAKE2
-   pairing flow — the server logs a 6-digit code, you type it
-   into the client. The two sides then pin each other's TLS
-   certificates and subsequent connects auto-authenticate.
+   pairing flow — the server menu bar item and stdout show a
+   6-digit code, you type it into the client. The two sides then
+   pin each other's TLS certificates and subsequent connects
+   auto-authenticate.
 
-Uninstall is the symmetric `target/release/kmwarp-server uninstall`
-— removes the plist and `launchctl unload -w`s it. Idempotent.
+Uninstall is the symmetric `kmwarp-server uninstall` — removes
+the plist and `launchctl unload -w`s it. Idempotent.
 
 The CLI also accepts `--help` and `--version`:
 
 ```sh
-target/release/kmwarp-server --help
+kmwarp-server --help
 ```
+
+### Build from source (Advanced)
+
+Developers who want to hack on the server can build locally
+instead of using a release tarball. Requires Rust 1.82+ (the
+toolchain is pinned via `rust-toolchain.toml`):
+
+```sh
+cargo build --release -p kmwarp-server
+```
+
+The binary lands at `target/release/kmwarp-server`. From there
+the `install` / `uninstall` subcommands above work identically.
+
+For builds suitable for distribution to other users (Gatekeeper-
+green, no "unidentified developer" warnings), use the build
+script `scripts/build-mac.sh` documented under
+**Signed / notarized release builds** below.
 
 ## Install (Windows client)
 
-Register the client as an auto-start Windows service so it survives
-reboot and runs without a logged-in terminal.
+Download the latest MSI installer from the
+[Releases page](https://github.com/merajmehrabi/kmwarp/releases/latest)
+(file: `kmwarp-client-X.Y.Z-x86_64.msi`) and double-click it.
 
-1. Build the release binary on the Windows box:
+> **SmartScreen warning.** Windows will show
+> "Windows protected your PC" — click **More info → Run anyway**.
+> We don't have an Authenticode cert yet, so this warning is
+> expected. The binary is the same one built from this repo at
+> the tagged commit; reproduce it yourself if you want by
+> following **Build from source** below.
+
+After install:
+
+1. Launch **kmwarp client** from the Start Menu. A pairing
+   dialog opens on first run.
+2. Confirm the Mac server is running and showing its 6-digit
+   pairing code (menu bar status item, or `tail -f
+   /tmp/kmwarp-server.log`). Type that code into the dialog.
+3. The MSI also registers `kmwarp-client` as an auto-start
+   Windows service so it survives reboot. Verify with
+   `Get-Service kmwarp-client` from PowerShell — should report
+   `Running`. The pin file at `%APPDATA%\kmwarp\config\peer.pin`
+   is shared with the service so subsequent reconnects
+   auto-authenticate.
+4. The client auto-discovers the server on the LAN via mDNS —
+   no address configuration needed in the typical case.
+
+To uninstall, use **Settings → Apps → kmwarp client → Uninstall**
+(or `Get-Package kmwarp-client | Uninstall-Package` from an
+elevated PowerShell).
+
+### Build from source (Advanced)
+
+If you'd rather build the client yourself (to audit the binary,
+develop locally, or run an untagged commit), you'll need Rust
+1.82+ on a Windows host:
+
+1. Build the release binary:
    ```powershell
    cargo build --release -p kmwarp-client
    ```
-2. Open PowerShell **as Administrator** (the SCM rejects unprivileged
-   `create_service` calls).
+2. Open PowerShell **as Administrator** (the SCM rejects
+   unprivileged `create_service` calls).
 3. Install + start:
    ```powershell
    .\target\release\kmwarp-client.exe install
    ```
-4. Verify with `Get-Service kmwarp-client` — should report `Running`.
-   Reboot to confirm AutoStart works.
-5. The client auto-discovers the server on the LAN via mDNS — no
-   address configuration needed in the typical case. Set
-   `KMWARP_CONNECT=ip:port` only to override (manual targeting, or in
-   environments where mDNS multicast is blocked).
-6. Pair (one-time): launch interactively once
-   (`.\target\release\kmwarp-client.exe`) to enter the 6-digit SPAKE2
-   code shown on the Mac. The pin file at
-   `%APPDATA%\kmwarp\peer.pin` is shared with the service.
-7. Uninstall:
+4. Verify with `Get-Service kmwarp-client` — should report
+   `Running`. Reboot to confirm AutoStart works.
+5. Pair (one-time): launch interactively once
+   (`.\target\release\kmwarp-client.exe`) to enter the 6-digit
+   SPAKE2 code shown on the Mac.
+6. Uninstall:
    ```powershell
    .\target\release\kmwarp-client.exe uninstall
    ```
