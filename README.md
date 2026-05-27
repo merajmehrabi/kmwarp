@@ -82,14 +82,32 @@ reboot and runs without a logged-in terminal.
    ```
 4. Verify with `Get-Service kmwarp-client` — should report `Running`.
    Reboot to confirm AutoStart works.
-5. Pair (one-time): launch interactively once
+5. The client auto-discovers the server on the LAN via mDNS — no
+   address configuration needed in the typical case. Set
+   `KMWARP_CONNECT=ip:port` only to override (manual targeting, or in
+   environments where mDNS multicast is blocked).
+6. Pair (one-time): launch interactively once
    (`.\target\release\kmwarp-client.exe`) to enter the 6-digit SPAKE2
    code shown on the Mac. The pin file at
    `%APPDATA%\kmwarp\peer.pin` is shared with the service.
-6. Uninstall:
+7. Uninstall:
    ```powershell
    .\target\release\kmwarp-client.exe uninstall
    ```
+
+### Troubleshooting: overriding auto-discovery
+
+If mDNS discovery doesn't work (multicast blocked, multiple servers on
+the LAN, or you want to pin a specific address), set `KMWARP_CONNECT`
+on the service environment:
+
+```powershell
+$key = "HKLM:\SYSTEM\CurrentControlSet\Services\kmwarp-client"
+New-ItemProperty -Path $key -Name "Environment" `
+  -Value @("KMWARP_CONNECT=192.168.0.34:51423") `
+  -PropertyType MultiString -Force
+Restart-Service kmwarp-client
+```
 
 ### Session-0 isolation (the gotcha)
 
