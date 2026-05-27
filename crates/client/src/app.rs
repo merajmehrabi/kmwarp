@@ -39,7 +39,7 @@ use kmwarp_core::clipboard::EchoGuard;
 use kmwarp_core::tls::{cert, PinStore};
 use kmwarp_core::wire::{Message, PROTO_VERSION};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinSet;
 use tokio::time::{interval, sleep, timeout, MissedTickBehavior};
 use tokio_rustls::TlsConnector;
@@ -53,6 +53,42 @@ use crate::sink::{build_default_sink, DefaultSink};
 use crate::tls::{
     build_client_config, default_config_dir, init_crypto_provider, pin_path, pinned_server_name,
 };
+
+/// Coarse-grained client lifecycle status. Mirrors `ServerStatus` on
+/// the macOS side; consumed by the Windows system-tray surface
+/// (`platform::windows::tray`) so the operator can see at a glance
+/// whether the Mac is currently controlling this box.
+///
+/// `Clone` required by `tokio::sync::watch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientStatus {
+    /// Pre-discovery / post-shutdown.
+    Idle,
+    /// mDNS browse in flight (only when KMWARP_CONNECT is unset).
+    Discovering,
+    /// Pairing flow active. `code` is the 6-digit SPAKE2 code the
+    /// operator typed into stdin; surfaced so the tray can echo it
+    /// back as a visual confirmation that input was captured.
+    Pairing { code: String },
+    /// TCP connected; TLS handshake in flight, or handshake done but
+    /// HelloAck not yet received.
+    Connecting { addr: SocketAddr },
+    /// Handshake accepted; in steady-state session, server is in
+    /// LocalActive (Mac owns input), Windows side is idle wrt
+    /// forwarding.
+    Connected { peer: String },
+    /// Server entered RemoteActive — every input event coming over
+    /// the wire is being injected on this box.
+    Driven { peer: String },
+}
+
+/// Best-effort publish helper. Swallows `SendError` when no live
+/// receivers — the tray is an optional consumer.
+fn publish_status(tx: Option<&watch::Sender<ClientStatus>>, status: ClientStatus) {
+    if let Some(tx) = tx {
+        let _ = tx.send(status);
+    }
+}
 
 /// Heartbeat cadence; spec §M1 mandates 500 ms.
 const HEARTBEAT_PERIOD: Duration = Duration::from_millis(500);
@@ -75,7 +111,17 @@ const OUTBOUND_CHANNEL_BOUND: usize = 256;
 /// Returns `Err` only on a hard handshake refusal — every other failure
 /// mode (connect refused, socket dropped, peer silence) is recoverable
 /// via reconnect.
-pub async fn run_client(connect: SocketAddr, peer_name: &str) -> anyhow::Result<()> {
+///
+/// When `status_tx` is `Some`, lifecycle transitions are published as
+/// [`ClientStatus`] values. The Windows tray surface holds the
+/// matching `Receiver` and re-renders on change. `None` disables the
+/// broadcast (used by `KMWARP_HEADLESS=1`, service contexts where no
+/// user-session tray can show, and tests).
+pub async fn run_client(
+    connect: SocketAddr,
+    peer_name: &str,
+    status_tx: Option<watch::Sender<ClientStatus>>,
+) -> anyhow::Result<()> {
     // M9 bootstrap: install crypto provider, resolve config dir,
     // load-or-generate cert+key, build the pin store. `KMWARP_REPAIR=1`
     // wipes the existing pin so the next connect re-enters pairing.
@@ -108,8 +154,15 @@ pub async fn run_client(connect: SocketAddr, peer_name: &str) -> anyhow::Result<
 
     let peer_name_arc: Arc<str> = Arc::from(peer_name);
     let cert_bundle = Arc::new(cert_bundle);
+    let status_tx = status_tx.map(Arc::new);
 
     loop {
+        // Before each connect attempt we go back to `Connecting` so a
+        // post-disconnect reconnect cycle is visible in the tray. The
+        // backoff sleep happens inside `connect_with_backoff` — the
+        // tray staying on `Connecting` during a backoff is exactly the
+        // right UX (the operator sees we're trying, not idle).
+        publish_status(status_tx.as_deref(), ClientStatus::Connecting { addr: connect });
         let stream = connect_with_backoff(connect).await;
         info!(addr = %connect, "connected to kmwarp-server at {connect}");
 
@@ -119,12 +172,14 @@ pub async fn run_client(connect: SocketAddr, peer_name: &str) -> anyhow::Result<
             &peer_name_arc,
             Arc::clone(&cert_bundle),
             Arc::clone(&pin_store),
+            status_tx.as_deref(),
         )
         .await
         {
             Ok(()) => info!(addr = %connect, "session ended; reconnecting"),
             Err(ClientError::HandshakeRejected) => {
                 error!(addr = %connect, "server rejected handshake; aborting");
+                publish_status(status_tx.as_deref(), ClientStatus::Idle);
                 return Err(ClientError::HandshakeRejected.into());
             }
             Err(e) => warn!(addr = %connect, error = %e, "session ended with error; reconnecting"),
@@ -166,6 +221,7 @@ async fn run_one_session(
     peer_name: &Arc<str>,
     cert_bundle: Arc<cert::CertBundle>,
     pin_store: Arc<PinStore>,
+    status_tx: Option<&watch::Sender<ClientStatus>>,
 ) -> Result<(), ClientError> {
     // Set TCP_NODELAY on the raw socket BEFORE the TLS handshake.
     stream.set_nodelay(true)?;
@@ -210,7 +266,26 @@ async fn run_one_session(
     // M9 pairing: if no pin yet, run the in-stream pairing flow BEFORE
     // the normal Hello / HelloAck.
     if pinned.is_none() {
-        match run_client_pairing_flow(&mut conn, &cert_bundle.cert_der, &pin_store).await {
+        // Hook so the pairing flow can publish the 6-digit code the
+        // operator types into stdin into the ClientStatus channel —
+        // the tray uses it as a "yes, I saw your input" confirmation.
+        let status_for_pairing = status_tx.cloned();
+        let on_pairing_code = move |code: &str| {
+            publish_status(
+                status_for_pairing.as_ref(),
+                ClientStatus::Pairing {
+                    code: code.to_string(),
+                },
+            );
+        };
+        match run_client_pairing_flow(
+            &mut conn,
+            &cert_bundle.cert_der,
+            &pin_store,
+            Some(&on_pairing_code),
+        )
+        .await
+        {
             Ok(()) => info!(addr = %addr, "pairing succeeded"),
             Err(e) => {
                 warn!(addr = %addr, error = %e, "pairing failed; will retry on reconnect");
@@ -239,6 +314,12 @@ async fn run_one_session(
                 screen = ?server_screen_px,
                 "handshake accepted; entering steady-state session"
             );
+            publish_status(
+                status_tx,
+                ClientStatus::Connected {
+                    peer: addr.to_string(),
+                },
+            );
         }
         other => {
             warn!(addr = %addr, ?other, "unexpected handshake response");
@@ -257,7 +338,7 @@ async fn run_one_session(
     };
 
     let (reader, writer) = conn.into_split();
-    run_session_tasks(addr, reader, writer, sink).await;
+    run_session_tasks(addr, reader, writer, sink, status_tx).await;
     Ok(())
 }
 
@@ -278,6 +359,7 @@ async fn run_session_tasks(
     reader: FrameReader,
     writer: FrameWriter,
     sink: DefaultSink,
+    status_tx: Option<&watch::Sender<ClientStatus>>,
 ) {
     let (tx_out, rx_out) = mpsc::channel::<Message>(OUTBOUND_CHANNEL_BOUND);
     let notify = Arc::new(Notify::new());
@@ -305,6 +387,7 @@ async fn run_session_tasks(
         tx_out.clone(),
         Arc::clone(&active),
         Arc::clone(&echo_guard),
+        status_tx.cloned(),
     ));
     set.spawn(deadline_watcher(addr, notify));
 
@@ -320,6 +403,8 @@ async fn run_session_tasks(
             tx_out.clone(),
             Arc::clone(&active),
             safe_warp_x,
+            status_tx.cloned(),
+            addr,
         ));
         // Clipboard listener install can fail (RegisterClassW etc).
         // Treat as non-fatal: log and skip the out-pump; inbound writes
@@ -366,15 +451,27 @@ async fn spawn_encoder(rx: mpsc::Receiver<Message>, writer: FrameWriter) -> Task
 
 /// Wrap the injector so it surfaces a [`TaskExit`] discriminant.
 async fn spawn_injector(
-    _addr: SocketAddr,
+    addr: SocketAddr,
     reader: FrameReader,
     sink: DefaultSink,
     notify: Arc<Notify>,
     tx_out: mpsc::Sender<Message>,
     active: Arc<AtomicBool>,
     echo_guard: Arc<Mutex<EchoGuard>>,
+    status_tx: Option<watch::Sender<ClientStatus>>,
 ) -> TaskExit {
-    match injector_loop(reader, sink, notify, tx_out, active, echo_guard).await {
+    match injector_loop(
+        reader,
+        sink,
+        notify,
+        tx_out,
+        active,
+        echo_guard,
+        status_tx,
+        addr,
+    )
+    .await
+    {
         Ok(()) => TaskExit::PeerByeOrClose,
         Err(e) => TaskExit::ReaderFailed(e.to_string()),
     }
@@ -402,9 +499,11 @@ async fn spawn_cursor_watcher(
     tx_out: mpsc::Sender<Message>,
     active: Arc<AtomicBool>,
     safe_warp_x: i32,
+    status_tx: Option<watch::Sender<ClientStatus>>,
+    addr: SocketAddr,
 ) -> TaskExit {
     use crate::platform::windows::cursor_leave_watcher;
-    cursor_leave_watcher(tx_out, active, safe_warp_x).await;
+    cursor_leave_watcher(tx_out, active, safe_warp_x, status_tx, addr).await;
     TaskExit::CursorWatcherExited
 }
 

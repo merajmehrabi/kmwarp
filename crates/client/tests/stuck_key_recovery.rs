@@ -116,7 +116,16 @@ async fn stuck_key_recovery_drains_held_keys_on_disconnect() {
     //    (Disconnected) almost immediately after consuming the 5 frames,
     //    and the drain runs synchronously before that return.
     let echo_guard = Arc::new(Mutex::new(EchoGuard::new()));
-    let run = injector_loop_with_source(source, sink, notify, tx_out, active, echo_guard);
+    let run = injector_loop_with_source(
+        source,
+        sink,
+        notify,
+        tx_out,
+        active,
+        echo_guard,
+        None,
+        "127.0.0.1:0".parse().expect("test addr parses"),
+    );
     let result = tokio::time::timeout(Duration::from_secs(3), run)
         .await
         .expect("injector hung past 3s backstop");
@@ -194,7 +203,16 @@ async fn no_drain_when_held_set_is_balanced_before_disconnect() {
     let active = Arc::new(AtomicBool::new(false));
 
     let echo_guard = Arc::new(Mutex::new(EchoGuard::new()));
-    let run = injector_loop_with_source(source, sink, notify, tx_out, active, echo_guard);
+    let run = injector_loop_with_source(
+        source,
+        sink,
+        notify,
+        tx_out,
+        active,
+        echo_guard,
+        None,
+        "127.0.0.1:0".parse().expect("test addr parses"),
+    );
     let _ = tokio::time::timeout(Duration::from_secs(3), run)
         .await
         .expect("injector hung past 3s backstop");

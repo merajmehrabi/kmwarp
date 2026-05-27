@@ -26,6 +26,7 @@
 //! server and client cannot drift on `MouseButton.button` / `.state`
 //! dictionary values.
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -34,9 +35,10 @@ use kmwarp_core::clipboard::{EchoGuard, Reassembler};
 use kmwarp_core::stuck_keys::HeldKeys;
 use kmwarp_core::wire::{apply_key_to_sink, apply_mouse_to_sink, key_state_code, Message};
 use kmwarp_core::{InputSink, KeyState, ModMask};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use tracing::{debug, info, trace, warn};
 
+use crate::app::ClientStatus;
 use crate::error::ClientError;
 use crate::net::{FrameReader, FrameWriter};
 
@@ -242,8 +244,13 @@ pub async fn injector_loop<S: InputSink + Send>(
     tx_out: mpsc::Sender<Message>,
     active: Arc<AtomicBool>,
     echo_guard: Arc<Mutex<EchoGuard>>,
+    status_tx: Option<watch::Sender<ClientStatus>>,
+    peer_addr: SocketAddr,
 ) -> Result<(), ClientError> {
-    injector_loop_with_source(reader, sink, notify, tx_out, active, echo_guard).await
+    injector_loop_with_source(
+        reader, sink, notify, tx_out, active, echo_guard, status_tx, peer_addr,
+    )
+    .await
 }
 
 /// Generic injector entry-point used by both production (with a
@@ -259,6 +266,8 @@ pub async fn injector_loop_with_source<F, S>(
     tx_out: mpsc::Sender<Message>,
     active: Arc<AtomicBool>,
     echo_guard: Arc<Mutex<EchoGuard>>,
+    status_tx: Option<watch::Sender<ClientStatus>>,
+    peer_addr: SocketAddr,
 ) -> Result<(), ClientError>
 where
     F: FrameSource,
@@ -268,7 +277,14 @@ where
     loop {
         let msg = source.next_frame().await?;
         notify.notify_one();
-        dispatch_one(&msg, &mut guard, &tx_out, &active);
+        dispatch_one(
+            &msg,
+            &mut guard,
+            &tx_out,
+            &active,
+            status_tx.as_ref(),
+            peer_addr,
+        );
         if matches!(msg, Message::Bye { .. }) {
             return Ok(());
         }
@@ -286,6 +302,8 @@ pub(crate) fn dispatch_one<S: InputSink>(
     guard: &mut InjectorGuard<S>,
     tx_out: &mpsc::Sender<Message>,
     active: &Arc<AtomicBool>,
+    status_tx: Option<&watch::Sender<ClientStatus>>,
+    peer_addr: SocketAddr,
 ) {
     // Update held set before any side effect — even if the sink call
     // panics, the tracker reflects what the wire ordered.
@@ -332,6 +350,15 @@ pub(crate) fn dispatch_one<S: InputSink>(
                 .sink_mut()
                 .warp_cursor_abs(TAKE_ENTRY_INSET_PX, i32::from(*entry_y));
             active.store(true, Ordering::Relaxed);
+            // Surface "Mac is now controlling this box" to the tray.
+            // The reverse transition (Driven → Connected) happens in
+            // the Windows-only `cursor_leave_watcher` when it emits
+            // the outbound ReleaseControl.
+            if let Some(tx) = status_tx {
+                let _ = tx.send(ClientStatus::Driven {
+                    peer: peer_addr.to_string(),
+                });
+            }
         }
         Message::ReleaseControl { .. } => {
             trace!(

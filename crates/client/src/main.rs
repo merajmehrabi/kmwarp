@@ -148,7 +148,7 @@ fn run_foreground() -> Result<()> {
     // is fundamentally sync and a tokio attribute on `main` would force
     // a runtime where one isn't wanted.
     let rt = tokio::runtime::Runtime::new().context("building tokio runtime")?;
-    rt.block_on(run_client(connect, &peer_name))
+    rt.block_on(run_client(connect, &peer_name, None))
 }
 
 /// Resolve the server `SocketAddr` to connect to.

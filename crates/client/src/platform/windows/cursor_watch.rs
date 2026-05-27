@@ -31,14 +31,17 @@
 //! `active` flag also gets cleared; M6 server-side will set it again on
 //! the next `TakeControl`.
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use kmwarp_core::wire::Message;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use windows::Win32::Foundation::POINT;
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetCursorPos};
+
+use crate::app::ClientStatus;
 
 /// Cursor-poll cadence. 60 Hz matches the mouse-move event rate the
 /// server feeds in, so the watcher reacts within one frame of the user
@@ -64,6 +67,8 @@ pub async fn cursor_leave_watcher(
     out: mpsc::Sender<Message>,
     active: Arc<AtomicBool>,
     safe_warp_x: i32,
+    status_tx: Option<watch::Sender<ClientStatus>>,
+    peer_addr: SocketAddr,
 ) {
     let mut ticker = tokio::time::interval(POLL_PERIOD);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -106,6 +111,13 @@ pub async fn cursor_leave_watcher(
         }
 
         active.store(false, Ordering::Relaxed);
+        // Mirror the active=false flip into the tray: the Mac is no
+        // longer driving this box, we're back in `Connected`.
+        if let Some(tx) = status_tx.as_ref() {
+            let _ = tx.send(ClientStatus::Connected {
+                peer: peer_addr.to_string(),
+            });
+        }
 
         // Anti-thrash warp: park cursor at the interior X so the user's
         // continued leftward motion doesn't immediately re-trigger.

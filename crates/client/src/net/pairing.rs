@@ -56,15 +56,25 @@ pub enum ClientPairingError {
 /// Run the client-side pairing flow.
 ///
 /// On success the server's cert hash is written to `pin_store`.
+///
+/// `on_code` is invoked synchronously once the 6-digit code has been
+/// read from stdin. It exists so non-stdout UI surfaces (the Windows
+/// tray, primarily) can publish the code to the operator without
+/// scraping logs. Pass `None` when no extra publication is desired
+/// (headless runs, tests).
 pub async fn run_client_pairing_flow(
     conn: &mut Connection,
     cert_der: &[u8],
     pin_store: &PinStore,
+    on_code: Option<&(dyn Fn(&str) + Send + Sync)>,
 ) -> Result<(), ClientPairingError> {
     info!("entering client pairing mode (no peer.pin on disk yet)");
 
     // 1. Prompt for the code.
     let code = prompt_for_code().await?;
+    if let Some(cb) = on_code {
+        cb(&code);
+    }
 
     // 2. Receive PairSpakeA from server.
     let msg_a = match conn.read_frame().await? {
