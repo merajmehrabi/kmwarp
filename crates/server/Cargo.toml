@@ -46,7 +46,37 @@ async-trait = { workspace = true }
 core-graphics = { workspace = true }
 core-foundation = { workspace = true }
 objc2 = { workspace = true }
-# `NSPasteboard` feature gates the clipboard module from objc2-app-kit
-# (the crate is feature-gated per Apple framework class). M8 uses it.
-objc2-app-kit = { workspace = true, features = ["NSPasteboard"] }
-objc2-foundation = { workspace = true, features = ["NSString"] }
+# objc2-app-kit is feature-gated per Apple class; enable only what each
+# subsystem needs.
+#   NSPasteboard → M8 clipboard sync
+#   NSApplication / NSResponder → menu bar host (service::menubar)
+#   NSMenu / NSMenuItem        → menu bar pop-down
+#   NSStatusBar / NSStatusItem / NSStatusBarButton → menu bar surface
+#   NSButton / NSControl / NSView → required by NSStatusBarButton
+#   NSImage → space for future icon swap (optional but cheap)
+objc2-app-kit = { workspace = true, features = [
+    "NSPasteboard",
+    "NSApplication",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSMenu",
+    "NSMenuItem",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSButton",
+    "NSControl",
+    "NSView",
+    "NSImage",
+    "NSWindow",
+] }
+# Foundation features:
+#   NSString → existing clipboard usage
+#   NSThread → MainThreadMarker::new() (the safe runtime check)
+#   NSTimer + NSDate → NSTimer scheduled APIs used by the menubar tick
+objc2-foundation = { workspace = true, features = [
+    "NSString",
+    "NSThread",
+    "NSTimer",
+    "NSDate",
+] }
