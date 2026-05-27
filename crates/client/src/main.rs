@@ -22,11 +22,36 @@
 //!     networks or for pinning a specific peer when several Macs
 //!     are on the same LAN.
 //!   * `KMWARP_PEER_NAME` — name advertised to the server (default `kmwarp-client`).
+//!   * `KMWARP_HEADLESS` — when set to `1`, skip the system-tray icon and
+//!     run tokio on the main thread (v1.0 shape). Default-on inside the
+//!     Windows service entry point (session 0 can't show Shell_NotifyIconW
+//!     anyway). Set explicitly for CI / smoke tests.
 //!   * `RUST_LOG` — standard tracing filter (default `kmwarp=info`).
 //!   * `KMWARP_M3_DEMO` — when set to `1`, runs the M3 acceptance harness
 //!     instead of starting the client. Drives the local cursor in a smooth
 //!     50 px circle for 5 seconds via `SendInput`. Windows-only — on macOS
 //!     it logs a refusal and exits 0.
+//!
+//! ## v1.1 runtime topology (Windows interactive `run` subcommand)
+//!
+//! Mirrors the macOS server's NSApp split:
+//!
+//! ```text
+//!   main thread:   Win32 message pump + Shell_NotifyIconW tray
+//!   worker thread: tokio runtime + run_client task graph
+//! ```
+//!
+//! The tray surface (`platform::windows::tray`) requires a thread
+//! running `PeekMessageW`; that thread must be the one that created
+//! the tray window, and there's no cheap way to do that off the main
+//! thread without a foreign event loop. So tokio moves to a worker
+//! and main hosts the pump. Quit on the menu item runs the
+//! `on_quit` closure (tokio shutdown signal) and then `exit(0)` after
+//! a brief grace.
+//!
+//! `KMWARP_HEADLESS=1` bypasses the tray entirely and restores the
+//! v1.0 single-runtime-on-main shape. The Windows service entry
+//! point sets this internally because session 0 can't render a tray.
 //!
 //! M3 acceptance check (run on the Windows box):
 //!
@@ -84,10 +109,24 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kmwarp_client::app::run_client;
+#[cfg(target_os = "windows")]
+use kmwarp_client::app::ClientStatus;
 use kmwarp_client::discovery::{self, DEFAULT_BROWSE_TIMEOUT};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_PEER_NAME: &str = "kmwarp-client";
+
+/// Env var that suppresses the system-tray icon and routes the run
+/// path back to the v1.0 single-runtime-on-main shape.
+const HEADLESS_ENV: &str = "KMWARP_HEADLESS";
+
+/// Returns true if the user (or the service entry) explicitly asked
+/// for the no-tray path. Only consulted on Windows — non-Windows
+/// builds always take the headless branch anyway.
+#[cfg(target_os = "windows")]
+fn headless_requested() -> bool {
+    env::var(HEADLESS_ENV).ok().as_deref() == Some("1")
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "kmwarp-client", version, about = "kmwarp Windows client")]
@@ -120,7 +159,19 @@ fn main() -> Result<()> {
         Command::Install => install_subcommand(),
         Command::Uninstall => uninstall_subcommand(),
         Command::RunAsService => run_as_service_subcommand(),
-        Command::Run | Command::RunAsHelper => run_foreground(),
+        Command::Run => run_foreground(),
+        // The service's `CreateProcessAsUserW` spawn lands here. We
+        // force headless: Shell_NotifyIconW can usually render in a
+        // user-session helper, but the desktop attribute the service
+        // hands the spawn doesn't always wire up — and a tray that
+        // sometimes appears and sometimes doesn't is worse than one
+        // that never does. Tray for service-spawned helpers is a
+        // separate refactor; for now, the service path stays
+        // explicitly headless.
+        Command::RunAsHelper => {
+            std::env::set_var(HEADLESS_ENV, "1");
+            run_foreground()
+        }
     }
 }
 
@@ -140,15 +191,34 @@ fn run_foreground() -> Result<()> {
         return run_m3_demo();
     }
 
-    let connect = resolve_connect_addr()?;
     let peer_name = env::var("KMWARP_PEER_NAME").unwrap_or_else(|_| DEFAULT_PEER_NAME.to_string());
 
-    // Build a tokio runtime here rather than using #[tokio::main] so the
-    // service / install subcommands stay sync — Windows service dispatch
-    // is fundamentally sync and a tokio attribute on `main` would force
-    // a runtime where one isn't wanted.
-    let rt = tokio::runtime::Runtime::new().context("building tokio runtime")?;
-    rt.block_on(run_client(connect, &peer_name, None))
+    // Branch: tray-hosted (Windows interactive default) vs headless
+    // (KMWARP_HEADLESS=1, service contexts, non-Windows builds).
+    #[cfg(target_os = "windows")]
+    {
+        if !headless_requested() {
+            return run_with_tray(peer_name);
+        }
+    }
+
+    // Headless path: do the mDNS browse on main, then run the client
+    // on a single tokio runtime hosted on main. Matches v1.0 shape.
+    let connect = resolve_connect_addr(None)?;
+    run_blocking_on_tokio(async move { run_client(connect, &peer_name, None).await })
+}
+
+/// Build a multi-thread tokio runtime and `block_on` the supplied
+/// future. Used by the headless / non-Windows / demo paths.
+fn run_blocking_on_tokio<F>(fut: F) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime")?;
+    rt.block_on(fut)
 }
 
 /// Resolve the server `SocketAddr` to connect to.
@@ -159,12 +229,21 @@ fn run_foreground() -> Result<()> {
 ///   take the first resolved IPv4. This is the v1.1 zero-config
 ///   path that lets a fresh Windows install just-work.
 ///
+/// `status_tx` is optional; when present, the function publishes
+/// `ClientStatus::Discovering` for the duration of the mDNS browse
+/// so the tray reflects what's happening pre-connect. Headless
+/// callers pass `None`.
+///
 /// Returns a clean anyhow error if the env var is malformed OR the
 /// browse times out, so the operator sees a single human-readable
 /// line ("no kmwarp-server found on the LAN after 10000ms — is the
 /// Mac side running? …") rather than a stack of low-level mDNS
 /// errors.
-fn resolve_connect_addr() -> Result<SocketAddr> {
+#[allow(unused_variables)] // status_tx is Windows-only; suppress on macOS dev builds
+fn resolve_connect_addr(
+    #[cfg(target_os = "windows")] status_tx: Option<&tokio::sync::watch::Sender<ClientStatus>>,
+    #[cfg(not(target_os = "windows"))] status_tx: Option<&()>,
+) -> Result<SocketAddr> {
     if let Ok(connect_str) = env::var("KMWARP_CONNECT") {
         let addr: SocketAddr = connect_str
             .parse()
@@ -175,12 +254,72 @@ fn resolve_connect_addr() -> Result<SocketAddr> {
         );
         return Ok(addr);
     }
+    #[cfg(target_os = "windows")]
+    if let Some(tx) = status_tx {
+        let _ = tx.send(ClientStatus::Discovering);
+    }
     tracing::info!(
         timeout_ms = DEFAULT_BROWSE_TIMEOUT.as_millis() as u64,
         "KMWARP_CONNECT unset; browsing mDNS for kmwarp-server"
     );
     discovery::discover_server(DEFAULT_BROWSE_TIMEOUT)
         .context("mDNS discovery for kmwarp-server failed")
+}
+
+/// Windows interactive `run` path: tokio on a worker thread, Win32
+/// message pump + tray on main.
+///
+/// `on_quit` simply sleeps a short grace and `exit(0)`s — matching
+/// the macOS `run_with_menubar` shape. The runtime thread is
+/// abandoned mid-tick; the only persistent state (peer.pin) is
+/// written atomically by the pairing flow, and the process tear-down
+/// closes the TCP socket cleanly enough that the server-side reader
+/// task sees EOF and the M7 stuck-key drain on each side runs.
+#[cfg(target_os = "windows")]
+fn run_with_tray(peer_name: String) -> Result<()> {
+    use kmwarp_client::platform::windows::tray;
+    use std::thread;
+    use tokio::sync::watch;
+
+    let (status_tx, status_rx) = watch::channel(ClientStatus::Idle);
+
+    // Resolve the connect addr on main BEFORE moving anything onto
+    // the worker — discovery is a blocking call we don't want
+    // racing the tray bootstrap, and a malformed KMWARP_CONNECT
+    // should fail cleanly to the operator's terminal, not get
+    // surfaced through the tray.
+    let connect = resolve_connect_addr(Some(&status_tx))?;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime for tray mode")?;
+
+    // Worker thread owns the runtime + the client future. We don't
+    // join — Quit calls process::exit which tears every thread down.
+    let worker_peer_name = peer_name;
+    let worker_status_tx = status_tx;
+    thread::Builder::new()
+        .name("kmwarp-runtime".into())
+        .spawn(move || {
+            let result =
+                rt.block_on(run_client(connect, &worker_peer_name, Some(worker_status_tx)));
+            if let Err(e) = result {
+                tracing::error!(error = %e, "run_client exited with error");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        })
+        .context("spawning kmwarp-runtime thread")?;
+
+    let on_quit: Box<dyn FnOnce() + Send + 'static> = Box::new(|| {
+        tracing::info!("tray Quit; exiting in 500ms");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::process::exit(0);
+    });
+
+    // Hands main thread to the Win32 message pump; never returns.
+    tray::run_on_main_thread(status_rx, on_quit);
 }
 
 // ──────────────────────────────────────────────────────────────────────
