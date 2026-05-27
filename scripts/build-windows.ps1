@@ -13,11 +13,11 @@
 #     v0.4.0 targets WiX v3; cargo-wix supports v4 via a separate template.
 #   - cargo-wix subcommand. Auto-installed below if missing.
 #
-# Optional env vars (Authenticode signing — code signing is deferred for
+# Optional env vars (Authenticode signing -- code signing is deferred for
 # v0.4.0; leave unset to ship an unsigned MSI with a SmartScreen warning):
-#   KMWARP_PFX           — path to the .pfx Authenticode cert
-#   KMWARP_PFX_PASSWORD  — password protecting the .pfx
-#   KMWARP_TIMESTAMP_URL — RFC-3161 timestamp service URL
+#   KMWARP_PFX           -- path to the .pfx Authenticode cert
+#   KMWARP_PFX_PASSWORD  -- password protecting the .pfx
+#   KMWARP_TIMESTAMP_URL -- RFC-3161 timestamp service URL
 #                          (default: http://timestamp.digicert.com)
 #
 # For hardware-token-backed certs (USB HSM, Yubikey, etc.) replace the
@@ -62,7 +62,7 @@ if ($signingConfigured) {
 
     Write-Host "Signed binary ready: $binary"
 } else {
-    Write-Host "KMWARP_PFX/KMWARP_PFX_PASSWORD not set — skipping Authenticode signing."
+    Write-Host "KMWARP_PFX/KMWARP_PFX_PASSWORD not set -- skipping Authenticode signing."
     Write-Host "Unsigned binary: $binary"
 }
 
