@@ -22,6 +22,11 @@
 //! - [`tray`] — v1.1 system-tray status icon. Owns the Win32 message
 //!   pump for the process's main thread and exposes a one-shot Quit
 //!   action wired to the same shutdown path the menubar uses on macOS.
+//! - [`pairing_dialog`] — v1.1 native input dialog for the 6-digit
+//!   SPAKE2 pairing code. Replaces stdin reads on the tray-mode path
+//!   where no console is attached. Standalone skeleton — gets wired
+//!   into the pairing flow once task #13 lands the async code-
+//!   provider trait.
 //!
 //! The module is only compiled on Windows; `crate::platform::mod.rs` cfg-
 //! gates the `pub mod windows;`. On macOS this entire subtree is dead and
@@ -32,6 +37,7 @@ pub mod cursor_watch;
 pub mod dpi;
 pub mod inject;
 pub mod inject_error;
+pub mod pairing_dialog;
 pub mod tray;
 
 pub use clipboard::{read_clipboard_text, write_clipboard_text, WinClipboard};

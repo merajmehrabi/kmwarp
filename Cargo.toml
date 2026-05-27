@@ -87,6 +87,7 @@ windows = { version = "0.58", features = [
     "Win32_System_RemoteDesktop",
     "Win32_System_Environment",
     "Win32_Graphics_Gdi",
+    "Win32_UI_Controls",
 ] }
 windows-service = "0.7"
 
