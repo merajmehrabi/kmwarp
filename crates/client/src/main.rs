@@ -14,7 +14,13 @@
 //!   `run`; named distinctly so the service path is grep-able.
 //!
 //! Environment:
-//!   * `KMWARP_CONNECT` — server address to connect to (default `127.0.0.1:51423`).
+//!   * `KMWARP_CONNECT` — server address to connect to. When unset
+//!     (the v1.1 default), the client browses mDNS for
+//!     `_kmwarp._tcp.local.` for up to 10 s and uses the first
+//!     resolved IPv4 server. Setting it explicitly bypasses
+//!     discovery entirely — useful as an override for non-mDNS
+//!     networks or for pinning a specific peer when several Macs
+//!     are on the same LAN.
 //!   * `KMWARP_PEER_NAME` — name advertised to the server (default `kmwarp-client`).
 //!   * `RUST_LOG` — standard tracing filter (default `kmwarp=info`).
 //!   * `KMWARP_M3_DEMO` — when set to `1`, runs the M3 acceptance harness
@@ -78,9 +84,9 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use kmwarp_client::app::run_client;
+use kmwarp_client::discovery::{self, DEFAULT_BROWSE_TIMEOUT};
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_CONNECT: &str = "127.0.0.1:51423";
 const DEFAULT_PEER_NAME: &str = "kmwarp-client";
 
 #[derive(Parser, Debug)]
@@ -134,10 +140,7 @@ fn run_foreground() -> Result<()> {
         return run_m3_demo();
     }
 
-    let connect_str = env::var("KMWARP_CONNECT").unwrap_or_else(|_| DEFAULT_CONNECT.to_string());
-    let connect: SocketAddr = connect_str
-        .parse()
-        .with_context(|| format!("parsing KMWARP_CONNECT={connect_str:?}"))?;
+    let connect = resolve_connect_addr()?;
     let peer_name = env::var("KMWARP_PEER_NAME").unwrap_or_else(|_| DEFAULT_PEER_NAME.to_string());
 
     // Build a tokio runtime here rather than using #[tokio::main] so the
@@ -146,6 +149,38 @@ fn run_foreground() -> Result<()> {
     // a runtime where one isn't wanted.
     let rt = tokio::runtime::Runtime::new().context("building tokio runtime")?;
     rt.block_on(run_client(connect, &peer_name))
+}
+
+/// Resolve the server `SocketAddr` to connect to.
+///
+/// * `KMWARP_CONNECT=<ip>:<port>` set → parse it verbatim (existing
+///   v1.0 behaviour preserved as an override).
+/// * unset → browse mDNS `_kmwarp._tcp.local.` for up to 10 s and
+///   take the first resolved IPv4. This is the v1.1 zero-config
+///   path that lets a fresh Windows install just-work.
+///
+/// Returns a clean anyhow error if the env var is malformed OR the
+/// browse times out, so the operator sees a single human-readable
+/// line ("no kmwarp-server found on the LAN after 10000ms — is the
+/// Mac side running? …") rather than a stack of low-level mDNS
+/// errors.
+fn resolve_connect_addr() -> Result<SocketAddr> {
+    if let Ok(connect_str) = env::var("KMWARP_CONNECT") {
+        let addr: SocketAddr = connect_str
+            .parse()
+            .with_context(|| format!("parsing KMWARP_CONNECT={connect_str:?}"))?;
+        tracing::info!(
+            addr = %addr,
+            "KMWARP_CONNECT set; skipping mDNS discovery"
+        );
+        return Ok(addr);
+    }
+    tracing::info!(
+        timeout_ms = DEFAULT_BROWSE_TIMEOUT.as_millis() as u64,
+        "KMWARP_CONNECT unset; browsing mDNS for kmwarp-server"
+    );
+    discovery::discover_server(DEFAULT_BROWSE_TIMEOUT)
+        .context("mDNS discovery for kmwarp-server failed")
 }
 
 // ──────────────────────────────────────────────────────────────────────

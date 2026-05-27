@@ -682,6 +682,7 @@ dependencies = [
  "directories",
  "hex",
  "kmwarp-core",
+ "mdns-sd",
  "rcgen",
  "rustls",
  "serde",

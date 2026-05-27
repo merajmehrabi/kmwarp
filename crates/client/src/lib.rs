@@ -6,6 +6,7 @@
 //! without rebuilding the binary.
 
 pub mod app;
+pub mod discovery;
 pub mod error;
 pub mod net;
 pub mod platform;
