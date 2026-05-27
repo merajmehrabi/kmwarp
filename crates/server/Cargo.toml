@@ -70,14 +70,28 @@ objc2-app-kit = { workspace = true, features = [
     "NSView",
     "NSImage",
     "NSWindow",
+    # v1.1 pairing UX: prominent menubar code display + alert pop-up.
+    #   NSFont + NSFontDescriptor → monospaced font for the 6-digit code
+    #     (monospacedSystemFontOfSize:weight: lives behind NSFontDescriptor)
+    #   NSAttributedString → styled menu-item title carrying the font
+    #     attribute via NSFontAttributeName
+    #   NSAlert / NSPanel → "you're pairing — here's the code" pop-up
+    "NSFont",
+    "NSFontDescriptor",
+    "NSAttributedString",
+    "NSAlert",
+    "NSPanel",
 ] }
 # Foundation features:
 #   NSString → existing clipboard usage
 #   NSThread → MainThreadMarker::new() (the safe runtime check)
 #   NSTimer + NSDate → NSTimer scheduled APIs used by the menubar tick
+#   NSAttributedString + NSDictionary → styled code display in NSMenuItem
 objc2-foundation = { workspace = true, features = [
     "NSString",
     "NSThread",
     "NSTimer",
     "NSDate",
+    "NSAttributedString",
+    "NSDictionary",
 ] }

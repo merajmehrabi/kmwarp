@@ -6,6 +6,28 @@
 //! top-right of the screen, with a small pop-down menu carrying a
 //! human-readable status line and a Quit action.
 //!
+//! ## Pairing surface (v1.1)
+//!
+//! When [`ServerStatus::Pairing { code }`] is the live state, the menu
+//! grows three transient items at the top:
+//!
+//! ```text
+//!   Pairing code:                 (disabled label)
+//!   123456                        (monospaced, 22 pt)
+//!   Copy code                     (clicks → NSPasteboard write)
+//!   ───────────
+//!   Status: pairing — code 123456
+//!   ───────────
+//!   Quit kmwarp
+//! ```
+//!
+//! The items are constructed once at startup and toggled with
+//! `setHidden:` per transition, so the visible menu stays stable when
+//! not pairing. On the first tick that sees `Pairing`, an `NSAlert`
+//! is also raised so the operator notices even if the menu bar isn't
+//! in their direct line of sight. The alert is best-effort — under
+//! `.accessory` activation policy it won't steal focus, just appear.
+//!
 //! ## Threading model
 //!
 //! NSApplication / NSStatusItem MUST live on the process's main thread
@@ -48,10 +70,14 @@ use objc2::runtime::AnyObject;
 use objc2::sel;
 use objc2::{ClassType, DeclaredClass};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSFont, NSFontAttributeName,
+    NSFontWeightRegular, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
     NSVariableStatusItemLength,
 };
-use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString, NSTimer};
+use objc2_foundation::{
+    MainThreadMarker, NSAttributedString, NSDictionary, NSObject, NSObjectProtocol, NSString,
+    NSTimer,
+};
 use tokio::sync::watch;
 use tracing::{debug, info};
 
@@ -61,6 +87,12 @@ use crate::app::ServerStatus;
 /// bar feeling live (sub-frame for "perceptual immediate") without
 /// burning CPU on a process that's otherwise idle.
 const TICK_INTERVAL_SECONDS: f64 = 0.25;
+
+/// Point size for the monospaced pairing-code display in the menu.
+/// 22 pt is roughly twice the system menu item size — visibly
+/// prominent without overflowing on the user's 1512 px-wide main
+/// display.
+const PAIRING_CODE_POINT_SIZE: f64 = 22.0;
 
 /// Heap-allocated state held by [`MenubarController`]. Stored in an
 /// objc2 ivars struct so the Objective-C runtime can hand it back via
@@ -80,6 +112,26 @@ struct MenubarIvars {
     status_item: RefCell<Option<Retained<NSStatusItem>>>,
     /// The disabled "Status: …" menu item; updated in place each tick.
     status_label_item: RefCell<Option<Retained<NSMenuItem>>>,
+    /// "Pairing code:" label (always present in the menu, hidden when
+    /// not pairing).
+    pairing_label_item: RefCell<Option<Retained<NSMenuItem>>>,
+    /// Monospaced display of the 6-digit code (hidden when not pairing).
+    pairing_code_item: RefCell<Option<Retained<NSMenuItem>>>,
+    /// "Copy code" action item that writes the current code to
+    /// NSPasteboard via [`crate::platform::macos::clipboard::pasteboard_write`].
+    pairing_copy_item: RefCell<Option<Retained<NSMenuItem>>>,
+    /// Separator after the pairing block (hidden when not pairing so
+    /// the menu doesn't have a free-floating divider when the pairing
+    /// items themselves are gone).
+    pairing_separator_item: RefCell<Option<Retained<NSMenuItem>>>,
+    /// The currently-displayed pairing code, used by the `copyCode:`
+    /// selector. `None` when not in Pairing state.
+    current_pairing_code: RefCell<Option<String>>,
+    /// Whether we've already raised the NSAlert for the current
+    /// pairing session. Set true on first tick that sees Pairing,
+    /// reset to false whenever status leaves Pairing. Prevents the
+    /// alert from re-popping every tick.
+    alert_shown_for_current_pairing: RefCell<bool>,
     /// Last status rendered to the UI. Used to skip redundant
     /// re-renders (the NSTimer fires unconditionally; the watch may not
     /// have advanced).
@@ -135,6 +187,27 @@ declare_class!(
                 app.terminate(None);
             }
         }
+
+        /// "Copy code" menu item action. Writes the live pairing code
+        /// to the system pasteboard so the operator can paste it
+        /// directly into the Windows tray dialog.
+        ///
+        /// No-ops if the current_pairing_code ivar is empty (the menu
+        /// item should be hidden in that case, but we double-check to
+        /// stay safe against race conditions).
+        #[method(copyCode:)]
+        fn copy_code(&self, _sender: *mut AnyObject) {
+            let code = self.ivars().current_pairing_code.borrow().clone();
+            if let Some(code) = code {
+                info!(len = code.len(), "menubar: copying pairing code to pasteboard");
+                // Reuses the existing NSPasteboard helper from the
+                // clipboard sync module — same thread-safety
+                // guarantees apply.
+                crate::platform::macos::clipboard::pasteboard_write(&code);
+            } else {
+                debug!("menubar: copyCode fired with no code in flight; ignoring");
+            }
+        }
     }
 );
 
@@ -153,6 +226,12 @@ impl MenubarController {
             on_quit: RefCell::new(Some(on_quit)),
             status_item: RefCell::new(None),
             status_label_item: RefCell::new(None),
+            pairing_label_item: RefCell::new(None),
+            pairing_code_item: RefCell::new(None),
+            pairing_copy_item: RefCell::new(None),
+            pairing_separator_item: RefCell::new(None),
+            current_pairing_code: RefCell::new(None),
+            alert_shown_for_current_pairing: RefCell::new(false),
             last_rendered: RefCell::new(None),
         });
         // SAFETY: standard NSObject `init` — the macro-generated alloc
@@ -161,8 +240,8 @@ impl MenubarController {
         unsafe { msg_send_id![super(this), init] }
     }
 
-    /// Render `status` into the menubar button + "Status: …" menu
-    /// line. Idempotent; called from the timer tick.
+    /// Render `status` into the menubar button, the "Status: …" line,
+    /// and the pairing block. Idempotent; called from the timer tick.
     fn render(&self, status: &ServerStatus) {
         let (glyph, full_text) = format_status(status);
         let title = format!("{glyph} kmwarp");
@@ -183,6 +262,77 @@ impl MenubarController {
         // Update the disabled status-line menu item.
         if let Some(item) = ivars.status_label_item.borrow().as_ref() {
             unsafe { item.setTitle(&NSString::from_str(&label)) };
+        }
+
+        // Pairing-block visibility + content. Only the Pairing variant
+        // shows the dedicated code surface.
+        match status {
+            ServerStatus::Pairing { code } => {
+                self.show_pairing_block(code);
+            }
+            _ => {
+                self.hide_pairing_block();
+            }
+        }
+    }
+
+    /// Configure the pairing-block menu items for the current `code`
+    /// and reveal them. Idempotent — safe to call every tick while
+    /// in Pairing state.
+    fn show_pairing_block(&self, code: &str) {
+        let ivars = self.ivars();
+        *ivars.current_pairing_code.borrow_mut() = Some(code.to_string());
+
+        // Update the monospaced code display. The attributed title
+        // survives across ticks but the code text might change if the
+        // pairing flow rolls a fresh code, so always re-set.
+        if let Some(item) = ivars.pairing_code_item.borrow().as_ref() {
+            let attr = build_code_attributed_string(code);
+            // SAFETY: setAttributedTitle: is a main-thread mutator on
+            // an item we own; no aliasing.
+            unsafe { item.setAttributedTitle(Some(&attr)) };
+        }
+
+        // Unhide everything in the pairing block.
+        for item in [
+            &ivars.pairing_label_item,
+            &ivars.pairing_code_item,
+            &ivars.pairing_copy_item,
+            &ivars.pairing_separator_item,
+        ] {
+            if let Some(item) = item.borrow().as_ref() {
+                // SAFETY: setHidden: is a main-thread mutator.
+                unsafe { item.setHidden(false) };
+            }
+        }
+
+        // First-time-into-Pairing nudge: pop an NSAlert so the
+        // operator notices even if the menu bar isn't in their field
+        // of view. Best-effort — accessory apps don't steal focus, so
+        // the alert appears but the user keeps their existing focus.
+        let mut shown = ivars.alert_shown_for_current_pairing.borrow_mut();
+        if !*shown {
+            *shown = true;
+            drop(shown);
+            raise_pairing_alert(code);
+        }
+    }
+
+    /// Hide every pairing-block item and forget the current code.
+    /// Safe to call repeatedly; no-op when already hidden.
+    fn hide_pairing_block(&self) {
+        let ivars = self.ivars();
+        *ivars.current_pairing_code.borrow_mut() = None;
+        *ivars.alert_shown_for_current_pairing.borrow_mut() = false;
+        for item in [
+            &ivars.pairing_label_item,
+            &ivars.pairing_code_item,
+            &ivars.pairing_copy_item,
+            &ivars.pairing_separator_item,
+        ] {
+            if let Some(item) = item.borrow().as_ref() {
+                unsafe { item.setHidden(true) };
+            }
         }
     }
 
@@ -209,6 +359,57 @@ impl MenubarController {
         drop(last);
         debug!(?latest, "menubar: re-rendering status");
         self.render(&latest);
+    }
+}
+
+/// Build an NSAttributedString containing the pairing code in
+/// monospaced [`PAIRING_CODE_POINT_SIZE`] pt with leading spaces for
+/// visual breathing room inside the menu.
+///
+/// Erases the typed NSFont through `Retained::cast` because
+/// `NSDictionary::from_id_slice` would otherwise infer the value type
+/// as `NSObject`, and `NSAttributedString::initWithString_attributes`
+/// wants `NSDictionary<_, AnyObject>`.
+fn build_code_attributed_string(code: &str) -> Retained<NSAttributedString> {
+    use objc2::runtime::AnyObject;
+    // SAFETY: All three calls are main-thread API surface. We're on
+    // the main thread inside the timer tick / startup path. The cast
+    // from `Retained<NSFont>` to `Retained<AnyObject>` is safe because
+    // every Objective-C class is a subclass of NSObject and `AnyObject`
+    // is the universal-base typed-erased handle.
+    unsafe {
+        let font = NSFont::monospacedSystemFontOfSize_weight(
+            PAIRING_CODE_POINT_SIZE,
+            NSFontWeightRegular,
+        );
+        let font_any: Retained<AnyObject> = Retained::cast(font);
+        let key: &NSString = NSFontAttributeName;
+        let attrs: Retained<NSDictionary<NSString, AnyObject>> =
+            NSDictionary::from_id_slice(&[key], &[font_any]);
+        let text = NSString::from_str(&format!("  {code}"));
+        NSAttributedString::initWithString_attributes(
+            NSAttributedString::alloc(),
+            &text,
+            Some(&attrs),
+        )
+    }
+}
+
+/// Raise an NSAlert announcing the active pairing code. Best-effort
+/// and blocking — the operator's click on OK returns control to the
+/// timer loop. Under `.accessory` activation policy the alert appears
+/// without stealing focus from whatever the user was doing.
+fn raise_pairing_alert(code: &str) {
+    // SAFETY: NSAlert::new + setters + runModal are main-thread APIs.
+    // We're on the main thread (timer tick).
+    unsafe {
+        let mtm = MainThreadMarker::new_unchecked();
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str("kmwarp pairing in progress"));
+        alert.setInformativeText(&NSString::from_str(&format!(
+            "Enter this code in the Windows client:\n\n  {code}\n\nThe code is also visible in the menu bar dropdown."
+        )));
+        let _response = alert.runModal();
     }
 }
 
@@ -255,16 +456,60 @@ pub fn run_on_main_thread(
     // 3. Allocate the controller (carries ivars + Quit handler).
     let controller = MenubarController::new(mtm, rx, on_quit);
 
-    // 4. Build the pop-down menu:
-    //    [Status: <...>] (disabled)
-    //    --------------
-    //    [Quit kmwarp]
+    // 4. Build the pop-down menu in display order:
+    //
+    //      [Pairing code:]           (disabled, hidden by default)
+    //      [<code monospace>]        (hidden by default)
+    //      [Copy code]               (hidden by default)
+    //      ─────────────             (hidden by default)
+    //      [Status: <text>]          (disabled, always visible)
+    //      ─────────────             (always visible)
+    //      [Quit kmwarp]             (Cmd+Q, always visible)
     let menu: Retained<NSMenu> = NSMenu::new(mtm);
 
-    // SAFETY for the two menu-item construction blocks below:
-    // setTitle:/setEnabled:/setAction:/setTarget:/setKeyEquivalent:
-    // are main-thread mutators on a freshly-allocated NSMenuItem
-    // that no other code has a reference to yet. No aliasing.
+    // SAFETY for the menu-item construction blocks below:
+    // setTitle:/setEnabled:/setAction:/setTarget:/setKeyEquivalent:/
+    // setHidden: are main-thread mutators on freshly-allocated
+    // NSMenuItems that no other code has a reference to yet. No
+    // aliasing.
+
+    // 4a. Pairing block (hidden by default).
+    let pairing_label_item: Retained<NSMenuItem> = unsafe {
+        let item = NSMenuItem::new(mtm);
+        item.setTitle(&NSString::from_str("Pairing code:"));
+        item.setEnabled(false);
+        item.setHidden(true);
+        item
+    };
+    menu.addItem(&pairing_label_item);
+
+    let pairing_code_item: Retained<NSMenuItem> = unsafe {
+        let item = NSMenuItem::new(mtm);
+        // Initial placeholder; replaced by `show_pairing_block` with
+        // an NSAttributedString carrying the real code in monospace.
+        item.setTitle(&NSString::from_str("      "));
+        item.setEnabled(false);
+        item.setHidden(true);
+        item
+    };
+    menu.addItem(&pairing_code_item);
+
+    let pairing_copy_item: Retained<NSMenuItem> = unsafe {
+        let item = NSMenuItem::new(mtm);
+        item.setTitle(&NSString::from_str("Copy code"));
+        item.setAction(Some(sel!(copyCode:)));
+        let target: &AnyObject = controller.as_ref();
+        item.setTarget(Some(target));
+        item.setHidden(true);
+        item
+    };
+    menu.addItem(&pairing_copy_item);
+
+    let pairing_separator_item = NSMenuItem::separatorItem(mtm);
+    unsafe { pairing_separator_item.setHidden(true) };
+    menu.addItem(&pairing_separator_item);
+
+    // 4b. Always-visible block.
     let status_label_item: Retained<NSMenuItem> = unsafe {
         let item = NSMenuItem::new(mtm);
         item.setTitle(&NSString::from_str("Status: starting…"));
@@ -298,6 +543,10 @@ pub fn run_on_main_thread(
     unsafe { status_item.setMenu(Some(&menu)) };
     *controller.ivars().status_item.borrow_mut() = Some(status_item);
     *controller.ivars().status_label_item.borrow_mut() = Some(status_label_item);
+    *controller.ivars().pairing_label_item.borrow_mut() = Some(pairing_label_item);
+    *controller.ivars().pairing_code_item.borrow_mut() = Some(pairing_code_item);
+    *controller.ivars().pairing_copy_item.borrow_mut() = Some(pairing_copy_item);
+    *controller.ivars().pairing_separator_item.borrow_mut() = Some(pairing_separator_item);
 
     // 5. Schedule the polling timer. Target = controller, selector =
     //    `tick:`, repeats forever at TICK_INTERVAL_SECONDS. We hold
