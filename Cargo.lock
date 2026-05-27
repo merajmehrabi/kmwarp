@@ -742,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "kmwarp-client"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -772,7 +772,7 @@ dependencies = [
 
 [[package]]
 name = "kmwarp-core"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "kmwarp-server"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
