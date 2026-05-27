@@ -14,7 +14,7 @@ Strict trait boundaries: `core::platform::{InputSource, InputSink, Clipboard}`. 
 
 ## Build / test / lint
 
-The repo pins `rust-toolchain.toml = 1.82.0`, but several transitive deps (clap_lex ≥1.1) require **Rust 1.85+**. Always build with stable:
+The repo pins `rust-toolchain.toml = 1.82.0`, but several transitive deps (clap_lex ≥1.1, hashbrown ≥0.17 via mdns-sd) require **Rust 1.85+**. Always build with stable:
 
 ```sh
 RUSTUP_TOOLCHAIN=stable cargo build --workspace
@@ -23,7 +23,15 @@ RUSTUP_TOOLCHAIN=stable cargo clippy --workspace --all-targets -- -D warnings
 RUSTUP_TOOLCHAIN=stable cargo fmt --check
 ```
 
-Windows builds run on the user's test box at `ssh meraj@192.168.0.34 -p 2222`.
+The same env var is hoisted to workflow scope in `.github/workflows/{ci,release}.yml` — do not add a per-step rust-toolchain action without keeping the env override in place.
+
+Windows builds run on the user's test box at `ssh meraj@192.168.0.34 -p 2222` (PowerShell shell). The MSI build pipeline lives at `scripts/build-windows.ps1` and is invoked by the release workflow on tag push; requires WiX Toolset v3 (`choco install wixtoolset`) and cargo-wix (`cargo install --locked cargo-wix`). Authenticode signing is skipped when `$env:KMWARP_PFX` is unset.
+
+## Packaging
+
+- **macOS server**: tarball at GitHub release assets (`kmwarp-server-vX.Y.Z-aarch64-apple-darwin.tar.gz`). LaunchAgent install path: `kmwarp-server install` writes `~/Library/LaunchAgents/com.kmwarp.server.plist`.
+- **Windows client**: MSI at GitHub release assets (`kmwarp-client-X.Y.Z-x86_64.msi`). Install dir `C:\Program Files\kmwarp\`. UpgradeCode pinned forever: `8653FDBE-76BB-4B51-B4AE-5B3C7F4352C4` — **do not change**, breaks the upgrade path.
+- No code signing yet (Authenticode for Windows, notarization for macOS). SmartScreen / Gatekeeper warnings expected and documented in README.
 
 ## Wire protocol
 
@@ -70,4 +78,9 @@ Windows builds run on the user's test box at `ssh meraj@192.168.0.34 -p 2222`.
 
 ## Status
 
-v0.1.0 shipped (tag `v0.1.0`). v1.1 in flight: menu bar status item (`crates/server/src/service/menubar.rs`).
+- v0.1.0 — M0–M10 (Mac → Windows software KVM, manual config, headless)
+- v0.2.0 — mDNS auto-discovery + dual status surfaces (macOS menubar + Windows tray icon)
+- v0.3.0 — pairing UX (NSAlert popup + Win32 native input dialog)
+- v0.4.0 — Windows MSI installer + automated release workflow (current)
+
+Active v1.1 hopper: multi-monitor topology editor, multi-peer disambiguation, Windows service helper-spawn (Session 0 bridge), codesign + notarize (blocked on enrollment).
