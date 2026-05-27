@@ -38,3 +38,4 @@ mdns-sd = { workspace = true }
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true }
 windows-service = { workspace = true }
+tray-icon = { workspace = true }

@@ -90,6 +90,12 @@ windows = { version = "0.58", features = [
 ] }
 windows-service = "0.7"
 
+# v1.1 — system tray icon on Windows. Pure-Rust wrapper around
+# Shell_NotifyIconW + the message-only window boilerplate. Default
+# features pull GTK on Linux only; we disable them for hygiene because
+# we only ever consume tray-icon under cfg(windows).
+tray-icon = { version = "0.24", default-features = false }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

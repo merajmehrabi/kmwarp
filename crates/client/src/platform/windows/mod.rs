@@ -19,6 +19,9 @@
 //! - [`clipboard`] — M8 clipboard listener (`AddClipboardFormatListener`
 //!   + message-only window) plus `OpenClipboard`/`SetClipboardData` free
 //!   functions for read/write.
+//! - [`tray`] — v1.1 system-tray status icon. Owns the Win32 message
+//!   pump for the process's main thread and exposes a one-shot Quit
+//!   action wired to the same shutdown path the menubar uses on macOS.
 //!
 //! The module is only compiled on Windows; `crate::platform::mod.rs` cfg-
 //! gates the `pub mod windows;`. On macOS this entire subtree is dead and
@@ -29,6 +32,7 @@ pub mod cursor_watch;
 pub mod dpi;
 pub mod inject;
 pub mod inject_error;
+pub mod tray;
 
 pub use clipboard::{read_clipboard_text, write_clipboard_text, WinClipboard};
 pub use cursor_watch::cursor_leave_watcher;
