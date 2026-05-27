@@ -77,16 +77,26 @@ pub enum ServerPairingError {
 /// `tmpfile + rename`). On any failure we send `PairRejected
 /// { reason_code }` so the client logs a clear refusal, then return
 /// `Err`.
+///
+/// `on_code` is invoked synchronously once the 6-digit code has been
+/// generated and printed to stdout. It exists so non-stdout UI
+/// surfaces (the macOS menu bar item, primarily) can publish the
+/// code to the operator without scraping logs. Pass `None` when no
+/// extra publication is desired (tests, headless runs).
 pub async fn run_server_pairing_flow(
     conn: &mut Connection,
     cert_der: &[u8],
     pin_store: &PinStore,
+    on_code: Option<&(dyn Fn(&str) + Send + Sync)>,
 ) -> Result<(), ServerPairingError> {
     info!("entering server pairing mode (no peer.pin on disk yet)");
 
     // 1. Generate the 6-digit code and present it to the operator.
     let code = generate_code()?;
     display_code(&code)?;
+    if let Some(cb) = on_code {
+        cb(&code);
+    }
 
     // 2. Start SPAKE2 server side and send element A.
     let (session, msg_a) = ServerPairing::start(&code)?;

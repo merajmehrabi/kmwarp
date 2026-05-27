@@ -92,11 +92,51 @@ use anyhow::Context;
 use kmwarp_core::tls::{cert, PinStore};
 use kmwarp_core::wire::Message;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinSet;
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, trace, warn};
+
+/// Coarse-grained server lifecycle status. Published over a
+/// `tokio::sync::watch` channel by [`run_server`] so non-runtime UI
+/// surfaces (currently: the macOS `NSStatusItem` menu bar item built
+/// in `service::menubar`) can render the current state without
+/// reaching into the per-peer task graph.
+///
+/// The variants form a coarse state machine — there is no formal
+/// transition table; the runtime simply emits the most recently true
+/// status. UI consumers should always treat the latest watch value as
+/// authoritative and ignore intermediate transitions they missed.
+///
+/// `Clone` is required by `tokio::sync::watch`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerStatus {
+    /// Server is not yet bound (pre-listen) or post-shutdown.
+    Idle,
+    /// Bound to `addr`, waiting for an inbound connection (no peer
+    /// session in progress). This is the steady-state when no peer
+    /// is paired in.
+    Listening { addr: SocketAddr },
+    /// Pairing in progress; `code` is the 6-digit SPAKE2 code being
+    /// shown to the operator. Replaced by `Connected` on success or
+    /// `Listening` on failure.
+    Pairing { code: String },
+    /// TLS handshake + Hello/HelloAck completed with `peer`; the edge
+    /// state machine is in LocalActive (Mac owns input).
+    Connected { peer: String },
+    /// Edge state machine entered RemoteActive — Mac is forwarding
+    /// every input to `peer` (cursor swallowed locally).
+    Active { peer: String },
+}
+
+/// Best-effort status publish. Swallows `SendError` (no live
+/// receivers) because the menu bar is an optional consumer.
+fn publish_status(tx: Option<&watch::Sender<ServerStatus>>, status: ServerStatus) {
+    if let Some(tx) = tx {
+        let _ = tx.send(status);
+    }
+}
 
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicBool;
@@ -179,7 +219,16 @@ const LATENCY_PROBE_SAMPLES_PER_REPORT: u64 = 1000;
 ///
 /// Returns `Err` only if the initial bind fails. Per-peer failures are
 /// logged inside the spawned task and isolated to that peer.
-pub async fn run_server(bind: SocketAddr, peer_name: &str) -> anyhow::Result<()> {
+///
+/// When `status_tx` is `Some`, lifecycle transitions are published over
+/// the watch channel as [`ServerStatus`] values (see that enum's doc
+/// for the variants). `None` disables broadcast — useful for tests and
+/// the `KMWARP_HEADLESS=1` direct entry path.
+pub async fn run_server(
+    bind: SocketAddr,
+    peer_name: &str,
+    status_tx: Option<watch::Sender<ServerStatus>>,
+) -> anyhow::Result<()> {
     // M9 bootstrap: install the rustls crypto provider, resolve the
     // config dir, load or generate the self-signed cert + key, build a
     // PinStore. `KMWARP_REPAIR=1` deletes any existing pin so the next
@@ -216,10 +265,15 @@ pub async fn run_server(bind: SocketAddr, peer_name: &str) -> anyhow::Result<()>
         .with_context(|| format!("binding kmwarp-server to {bind}"))?;
     let local_addr = listener.local_addr().unwrap_or(bind);
     info!(addr = %local_addr, "kmwarp-server listening on {local_addr}");
+    publish_status(
+        status_tx.as_ref(),
+        ServerStatus::Listening { addr: local_addr },
+    );
 
     let peer_name: Arc<str> = Arc::from(peer_name);
     let mod_remap: Arc<kmwarp_core::modmap::ModRemap> = Arc::new(load_mod_remap_or_default());
     let cert_bundle = Arc::new(cert_bundle);
+    let status_tx = status_tx.map(Arc::new);
 
     loop {
         let (stream, remote) = match listener.accept().await {
@@ -233,12 +287,28 @@ pub async fn run_server(bind: SocketAddr, peer_name: &str) -> anyhow::Result<()>
         let mod_remap = Arc::clone(&mod_remap);
         let cert_bundle = Arc::clone(&cert_bundle);
         let pin_store = Arc::clone(&pin_store);
+        let status_tx = status_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_peer(stream, remote, peer_name, mod_remap, cert_bundle, pin_store).await
+            if let Err(e) = handle_peer(
+                stream,
+                remote,
+                peer_name,
+                mod_remap,
+                cert_bundle,
+                pin_store,
+                status_tx.as_deref(),
+            )
+            .await
             {
                 warn!(peer = %remote, error = %e, "peer session ended with error");
             }
+            // Whether the session ended cleanly or with an error,
+            // we're back to waiting for the next inbound connection.
+            // Republish Listening so the menubar drops back to idle.
+            publish_status(
+                status_tx.as_deref(),
+                ServerStatus::Listening { addr: local_addr },
+            );
         });
     }
 }
@@ -285,6 +355,7 @@ async fn handle_peer(
     mod_remap: Arc<kmwarp_core::modmap::ModRemap>,
     cert_bundle: Arc<cert::CertBundle>,
     pin_store: Arc<PinStore>,
+    status_tx: Option<&watch::Sender<ServerStatus>>,
 ) -> Result<(), ServerError> {
     info!(peer = %remote, "peer connected");
 
@@ -335,7 +406,27 @@ async fn handle_peer(
     // connects use pin mode. Fails → drop the session; the client will
     // reconnect and re-pair.
     if pinned.is_none() {
-        match run_server_pairing_flow(&mut conn, &cert_bundle.cert_der, &pin_store).await {
+        // Hook for the pairing flow to publish `ServerStatus::Pairing
+        // { code }` once it has generated the 6-digit code; the menu
+        // bar surface uses this to render the code where a user can
+        // glance at it without tail -f'ing the log.
+        let status_tx_for_pairing = status_tx.cloned();
+        let on_pairing_code = move |code: &str| {
+            publish_status(
+                status_tx_for_pairing.as_ref(),
+                ServerStatus::Pairing {
+                    code: code.to_string(),
+                },
+            );
+        };
+        match run_server_pairing_flow(
+            &mut conn,
+            &cert_bundle.cert_der,
+            &pin_store,
+            Some(&on_pairing_code),
+        )
+        .await
+        {
             Ok(()) => info!(peer = %remote, "pairing succeeded"),
             Err(e) => {
                 warn!(peer = %remote, error = %e, "pairing failed; closing connection");
@@ -373,6 +464,12 @@ async fn handle_peer(
         peer = %remote,
         "sent HelloAck (server={}, screen={:?})",
         server_peer_name, screen_px
+    );
+    publish_status(
+        status_tx,
+        ServerStatus::Connected {
+            peer: remote.to_string(),
+        },
     );
 
     let (reader, writer) = conn.into_split();
@@ -414,6 +511,7 @@ async fn handle_peer(
         screen_px.0,
         std::sync::Arc::clone(&held),
         Arc::clone(&mod_remap),
+        status_tx.cloned(),
     )
     .await;
 
@@ -973,6 +1071,7 @@ async fn spawn_input_brain(
     screen_w_px: u16,
     held: std::sync::Arc<std::sync::Mutex<kmwarp_core::stuck_keys::HeldKeys>>,
     mod_remap: Arc<kmwarp_core::modmap::ModRemap>,
+    status_tx: Option<watch::Sender<ServerStatus>>,
 ) -> Option<mpsc::Sender<BrainInput>> {
     use crate::platform::macos::MacInputSource;
 
@@ -1011,6 +1110,7 @@ async fn spawn_input_brain(
         screen_w_px,
         held,
         mod_remap,
+        status_tx,
     ));
 
     Some(brain_tx)
@@ -1072,6 +1172,7 @@ async fn edge_brain_task(
     screen_w_px: u16,
     held: std::sync::Arc<std::sync::Mutex<kmwarp_core::stuck_keys::HeldKeys>>,
     mod_remap: Arc<kmwarp_core::modmap::ModRemap>,
+    status_tx: Option<watch::Sender<ServerStatus>>,
 ) -> TaskExit {
     use kmwarp_core::edge::{EdgeConfig, StateMachine};
 
@@ -1166,7 +1267,14 @@ async fn edge_brain_task(
                 other => other,
             };
             execute_action(
-                remote, action, &mut sink, &tx_out, &swallow, &mod_remap, &held,
+                remote,
+                action,
+                &mut sink,
+                &tx_out,
+                &swallow,
+                &mod_remap,
+                &held,
+                status_tx.as_ref(),
             );
         }
     }
@@ -1193,6 +1301,7 @@ fn execute_action(
     swallow: &std::sync::Arc<AtomicBool>,
     mod_remap: &kmwarp_core::modmap::ModRemap,
     held: &std::sync::Arc<std::sync::Mutex<kmwarp_core::stuck_keys::HeldKeys>>,
+    status_tx: Option<&watch::Sender<ServerStatus>>,
 ) {
     use kmwarp_core::edge::Action;
     use kmwarp_core::platform::InputSink;
@@ -1235,6 +1344,12 @@ fn execute_action(
             // LocalActive doesn't forward keys.
             drain_held_to_peer(remote, tx_out, held, /* warn_if_nonempty */ true);
             swallow.store(true, Ordering::Relaxed);
+            publish_status(
+                status_tx,
+                ServerStatus::Active {
+                    peer: remote.to_string(),
+                },
+            );
         }
         Action::StopSwallow => {
             debug!(peer = %remote, "brain: StopSwallow (LocalActive)");
@@ -1243,6 +1358,15 @@ fn execute_action(
             // No-op if held is empty.
             drain_held_to_peer(remote, tx_out, held, /* warn_if_nonempty */ false);
             swallow.store(false, Ordering::Relaxed);
+            // SM dropped back to LocalActive — peer is still connected
+            // but no longer actively receiving input, so we go back
+            // to Connected (not Listening).
+            publish_status(
+                status_tx,
+                ServerStatus::Connected {
+                    peer: remote.to_string(),
+                },
+            );
         }
     }
 }

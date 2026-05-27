@@ -108,7 +108,7 @@ async fn run() -> Result<()> {
         .with_context(|| format!("parsing KMWARP_BIND={bind_str:?}"))?;
     let peer_name = env::var("KMWARP_PEER_NAME").unwrap_or_else(|_| DEFAULT_PEER_NAME.to_string());
 
-    run_server(bind, &peer_name).await
+    run_server(bind, &peer_name, None).await
 }
 
 #[cfg(target_os = "macos")]
