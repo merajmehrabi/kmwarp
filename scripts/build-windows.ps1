@@ -27,6 +27,19 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot)
 
+# rust-toolchain.toml pins 1.82 but several transitive deps (clap_lex 1.1)
+# require >=1.85; force stable for the duration of this script. See
+# CLAUDE.md "Build / test / lint".
+if (-not $env:RUSTUP_TOOLCHAIN) { $env:RUSTUP_TOOLCHAIN = "stable" }
+
+# WiX's `light.exe` and `candle.exe` are added to PATH by the choco
+# installer for newly-spawned shells. SSH-driven CI sessions may not see
+# the refresh; append the default install dir if it's missing.
+$wixBin = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
+if ((Test-Path $wixBin) -and -not ($env:Path -split ';' -contains $wixBin)) {
+    $env:Path = "$env:Path;$wixBin"
+}
+
 $target = "x86_64-pc-windows-msvc"
 $binary = "target\$target\release\kmwarp-client.exe"
 
