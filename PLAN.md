@@ -297,3 +297,24 @@ Full-hardware version (real Notepad) only at tag-time.
 ## Out-of-scope reminders (stays out of v1)
 
 File transfer, drag-and-drop, mobile clients, relay server, multi-monitor topology, per-app remaps, gamepad forwarding, audio. Anything that would be tempting to add mid-milestone goes into `IDEAS.md` and the milestone keeps moving.
+
+---
+
+## v1.1 progress (post-v1.0)
+
+M1–M10 complete and tagged as `v0.1.0`. Subsequent releases shipped from the v1.1 hopper in `IDEAS.md`:
+
+| Tag | Date | Highlights |
+|---|---|---|
+| `v0.2.0` | 2026-05-27 | mDNS auto-discovery; macOS menubar status item; Windows NotifyIcon tray; `ServerStatus` / `ClientStatus` `watch` channels |
+| `v0.3.0` | 2026-05-27 | Pairing UX: NSAlert popup with 22 pt mono code; Win32 native input dialog; `CodeProvider` async injection |
+| `v0.4.0` | 2026-05-28 | Windows MSI installer (cargo-wix, pinned UpgradeCode); GitHub Actions release workflow (Windows MSI + macOS tarball) |
+
+### Still open
+
+- **Multi-monitor topology editor** — Windows position currently hardcoded to right-of-Mac main display.
+- **Multi-peer disambiguation** — mDNS picks the first match; needs a tray submenu when ≥2 servers visible.
+- **Windows service helper-spawn** — Session 0 → user-session bridge for true daemon UX (the service path is headless today; only interactive `kmwarp-client.exe run` gets the tray).
+- **Codesign + notarize** — Authenticode for Windows MSI, Apple Developer ID for macOS server. Blocked on enrollment.
+
+See `IDEAS.md` for the full v1.1+ hopper.
