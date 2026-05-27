@@ -64,6 +64,9 @@ Windows builds run on the user's test box at `ssh meraj@192.168.0.34 -p 2222`.
 - Spec: `kmwarp-SPEC.md` — source of truth, re-read at each milestone.
 - Plan: `PLAN.md` — M0→M10 roadmap (v1.0 complete).
 - Future work: `IDEAS.md`.
+- Persisted state (resolved via the `directories` crate, NOT directly under the platform config root):
+  - mac: `~/.config/kmwarp/config/peer.pin` (and `cert.{pem,key}`)
+  - win: `%APPDATA%\kmwarp\config\peer.pin` (note the `\config\` subdir — easy to miss when force-deleting to re-pair)
 
 ## Status
 
