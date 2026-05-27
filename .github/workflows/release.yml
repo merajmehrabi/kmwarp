@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+# softprops/action-gh-release needs write access to create/update the
+# release and upload assets.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-msi:
+    name: Windows MSI
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+
+      - name: Install WiX Toolset v3
+        run: choco install wixtoolset --no-progress -y
+        shell: pwsh
+
+      - name: Install cargo-wix
+        run: cargo install --locked cargo-wix
+        shell: pwsh
+
+      - name: Build + package MSI
+        # scripts/build-windows.ps1 runs `cargo build --release` for the
+        # client then `cargo wix` to produce target/wix/*.msi. The script
+        # skips Authenticode signing when KMWARP_PFX is unset (we don't
+        # have a code-signing cert yet for v0.4.x — SmartScreen warning
+        # is expected and documented in the README).
+        run: .\scripts\build-windows.ps1
+        shell: pwsh
+
+      - name: List built artifacts
+        run: Get-ChildItem target\wix\
+        shell: pwsh
+
+      - name: Upload MSI to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/wix/*.msi
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  macos-tarball:
+    name: macOS server tarball
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+
+      - name: Build kmwarp-server (release)
+        run: cargo build --release -p kmwarp-server
+
+      - name: Tarball
+        run: |
+          tar czf "kmwarp-server-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz" \
+            -C target/release kmwarp-server
+
+      - name: Upload tarball to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: kmwarp-server-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+          fail_on_unmatched_files: true
+          generate_release_notes: true
