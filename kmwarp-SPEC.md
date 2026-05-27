@@ -150,6 +150,15 @@ macOS: poll `NSPasteboard.changeCount` at 4 Hz. Windows: register a clipboard li
 First connect: server displays a 6-digit code; client enters it; both derive a shared secret and pin each other's self-signed cert. Subsequent connects verify the pin.
 **Accept:** unpaired client is rejected with a clear log line; paired client reconnects without prompting; tampering with the pin file causes a verification failure, not a silent accept.
 
+#### Pairing UX surfaces (v1.1)
+
+v1.0 implemented the pairing handshake but routed the code through stdin on both sides: the server printed the 6-digit code with `writeln!(stderr, ...)`, the client read it with `tokio::io::stdin().read_line(...)`. v1.1 keeps the wire protocol identical and adds GUI surfaces so neither side needs a terminal:
+
+- **Server (macOS).** When `ServerStatus = Pairing { code }`, the menu bar dropdown shows the code in 22 pt monospace with a "Copy code" item that writes to `NSPasteboard`, and an `NSAlert` is raised once per pairing session announcing the code. The stdout box-around-the-code remains for headless installs.
+- **Client (Windows).** The tray-mode build (`kmwarp-client.exe run`) presents a modal Win32 input dialog asking for the 6-digit code (`Shell_NotifyIconW` apps have no console). The dialog runs on `spawn_blocking` so no tokio worker is parked while the user is typing. `KMWARP_HEADLESS=1` (and the `RunAsHelper` service-spawned path) reverts to the v1.0 stdin prompt.
+
+The pairing code itself flows through an injected `CodeProvider` (`Box<dyn FnOnce() -> BoxFuture<'static, Result<String>> + Send>`); the dispatch happens in `client::main::build_windows_dialog_factory` vs `stdin_code_provider`. Wire-level pairing is unchanged.
+
 ### M10 — Background service / daemon (several evenings)
 macOS: LaunchAgent plist, menu-bar status item. Windows: install as a Windows service so `SendInput` can target UAC-elevated windows.
 **Accept:** survives reboot on both sides; reconnects within 5 s of Wi-Fi return; menu bar item shows connected/disconnected.
