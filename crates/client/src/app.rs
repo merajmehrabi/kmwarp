@@ -47,7 +47,8 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::error::ClientError;
 use crate::net::{
-    encoder_loop, injector_loop, run_client_pairing_flow, Connection, FrameReader, FrameWriter,
+    encoder_loop, injector_loop, run_client_pairing_flow, CodeProvider, CodeProviderFactory,
+    Connection, FrameReader, FrameWriter,
 };
 use crate::sink::{build_default_sink, DefaultSink};
 use crate::tls::{
@@ -90,6 +91,27 @@ fn publish_status(tx: Option<&watch::Sender<ClientStatus>>, status: ClientStatus
     }
 }
 
+/// Wrap a [`CodeProvider`] so the resolved 6-digit code is also
+/// published into the [`ClientStatus`] channel as `Pairing { code }`.
+///
+/// The tray uses this echo as visual confirmation that input was
+/// captured (the dialog closes, the tray says "pairing — code XXXXXX",
+/// then SPAKE2 runs and the status flips to `Connected`).
+fn wrap_provider_publish(
+    inner: CodeProvider,
+    status_tx: Option<watch::Sender<ClientStatus>>,
+) -> CodeProvider {
+    Box::new(move || {
+        Box::pin(async move {
+            let result = inner().await;
+            if let (Ok(code), Some(tx)) = (&result, status_tx.as_ref()) {
+                let _ = tx.send(ClientStatus::Pairing { code: code.clone() });
+            }
+            result
+        })
+    })
+}
+
 /// Heartbeat cadence; spec §M1 mandates 500 ms.
 const HEARTBEAT_PERIOD: Duration = Duration::from_millis(500);
 
@@ -121,6 +143,7 @@ pub async fn run_client(
     connect: SocketAddr,
     peer_name: &str,
     status_tx: Option<watch::Sender<ClientStatus>>,
+    code_provider_factory: CodeProviderFactory,
 ) -> anyhow::Result<()> {
     // M9 bootstrap: install crypto provider, resolve config dir,
     // load-or-generate cert+key, build the pin store. `KMWARP_REPAIR=1`
@@ -155,6 +178,7 @@ pub async fn run_client(
     let peer_name_arc: Arc<str> = Arc::from(peer_name);
     let cert_bundle = Arc::new(cert_bundle);
     let status_tx = status_tx.map(Arc::new);
+    let code_provider_factory = Arc::new(code_provider_factory);
 
     loop {
         // Before each connect attempt we go back to `Connecting` so a
@@ -173,6 +197,7 @@ pub async fn run_client(
             Arc::clone(&cert_bundle),
             Arc::clone(&pin_store),
             status_tx.as_deref(),
+            Arc::clone(&code_provider_factory),
         )
         .await
         {
@@ -222,6 +247,7 @@ async fn run_one_session(
     cert_bundle: Arc<cert::CertBundle>,
     pin_store: Arc<PinStore>,
     status_tx: Option<&watch::Sender<ClientStatus>>,
+    code_provider_factory: Arc<CodeProviderFactory>,
 ) -> Result<(), ClientError> {
     // Set TCP_NODELAY on the raw socket BEFORE the TLS handshake.
     stream.set_nodelay(true)?;
@@ -266,25 +292,18 @@ async fn run_one_session(
     // M9 pairing: if no pin yet, run the in-stream pairing flow BEFORE
     // the normal Hello / HelloAck.
     if pinned.is_none() {
-        // Hook so the pairing flow can publish the 6-digit code the
-        // operator types into stdin into the ClientStatus channel —
-        // the tray uses it as a "yes, I saw your input" confirmation.
+        // Build a fresh provider for THIS attempt and wrap it so the
+        // ClientStatus channel sees the code immediately after the
+        // operator commits it. (Wrapping at this scope keeps the
+        // pairing flow itself free of the status channel — it only
+        // knows about `CodeProvider`.)
+        let inner = (code_provider_factory)();
+        // Clone the watch sender (cheap — it's an Arc internally) so
+        // the wrapped provider future can outlive this scope without
+        // borrowing the `&Sender`.
         let status_for_pairing = status_tx.cloned();
-        let on_pairing_code = move |code: &str| {
-            publish_status(
-                status_for_pairing.as_ref(),
-                ClientStatus::Pairing {
-                    code: code.to_string(),
-                },
-            );
-        };
-        match run_client_pairing_flow(
-            &mut conn,
-            &cert_bundle.cert_der,
-            &pin_store,
-            Some(&on_pairing_code),
-        )
-        .await
+        let provider = wrap_provider_publish(inner, status_for_pairing);
+        match run_client_pairing_flow(&mut conn, &cert_bundle.cert_der, &pin_store, provider).await
         {
             Ok(()) => info!(addr = %addr, "pairing succeeded"),
             Err(e) => {

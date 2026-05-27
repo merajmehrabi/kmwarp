@@ -2,8 +2,7 @@
 //!
 //! Mirror of `kmwarp_server::net::pairing`. The client:
 //!
-//! 1. Prompts the operator on stdin for the 6-digit code displayed by
-//!    the server.
+//! 1. Awaits the operator-supplied 6-digit code (see [`CodeProvider`]).
 //! 2. Receives `PairSpakeA`.
 //! 3. Sends `PairSpakeB`.
 //! 4. Finishes SPAKE2 → derives shared key K.
@@ -14,6 +13,36 @@
 //!
 //! Crypto primitives come from `kmwarp_core::pairing`; pin storage from
 //! `kmwarp_core::tls::PinStore`.
+//!
+//! ## Code provider contract (v1.1)
+//!
+//! v1.0 hard-coded an `stdin` read for step 1. v1.1 inverts the call:
+//! the operator-facing input surface is *injected* by the caller as a
+//! [`CodeProvider`]. Two production providers ship today:
+//!
+//! * [`stdin_code_provider`] — reads a line from stdin (CLI / headless
+//!   path; KMWARP_HEADLESS=1 services).
+//! * `crate::platform::windows::pairing_dialog::dialog_code_provider`
+//!   — pops a native Win32 input dialog (Windows tray path).
+//!
+//! Implementations are free to:
+//!   * run on any task (the future returned by the provider is `Send`
+//!     and may be awaited from a tokio worker);
+//!   * spawn helper threads (Windows dialogs in particular need a
+//!     dedicated GUI thread because the tokio runtime owns the tray's
+//!     main thread and can't block on `DialogBoxW`);
+//!   * fail fast with a descriptive `anyhow::Error` if the operator
+//!     cancels / times out — the pairing flow surfaces the message
+//!     to logs and aborts the attempt; the connect-loop will
+//!     reconnect and the provider will be re-invoked.
+//!
+//! The provider is consumed exactly once per pairing attempt
+//! (`FnOnce`); a fresh closure is built per attempt by the caller in
+//! `app::run_client` so any builder-style setup (HWND for the dialog,
+//! etc.) happens per-attempt and not at startup.
+
+use std::future::Future;
+use std::pin::Pin;
 
 use kmwarp_core::pairing::{cert_hmac, cert_hmac_verify, ClientPairing};
 use kmwarp_core::tls::{pin_hash_of, PinStore};
@@ -30,6 +59,53 @@ mod reject_code {
     pub const SPAKE2_FAILURE: u8 = 1;
     pub const HMAC_MISMATCH: u8 = 2;
     pub const PROTOCOL_VIOLATION: u8 = 5;
+}
+
+/// A pinned, boxed future that resolves to the operator-typed pairing
+/// code. `Send` because it crosses task boundaries inside the pairing
+/// flow; `'static` because the boxed closure that produces it lives
+/// independently of the call site.
+pub type CodeFuture = Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>>;
+
+/// One-shot async producer of the 6-digit pairing code. See module
+/// docs for the contract.
+///
+/// Construct one via [`stdin_code_provider`] (headless) or via the
+/// platform-specific dialog factory (Windows tray path).
+pub type CodeProvider = Box<dyn FnOnce() -> CodeFuture + Send>;
+
+/// Builder of fresh [`CodeProvider`]s, one per pairing attempt.
+///
+/// The pairing flow consumes a [`CodeProvider`] via `FnOnce`, but a
+/// connect-loop iteration that *fails* mid-pairing has to retry on
+/// the next reconnect — which means a fresh provider. The factory
+/// lives at `run_client` scope and is invoked once per attempt by
+/// `run_one_session`.
+///
+/// Standard factories:
+///   * `Box::new(|| stdin_code_provider())` — headless / terminal.
+///   * On Windows tray path:
+///     `Box::new(move || dialog_code_provider(hwnd_clone))`.
+pub type CodeProviderFactory = Box<dyn Fn() -> CodeProvider + Send + Sync>;
+
+/// Default provider: prompt the user on stdin for a 6-digit code,
+/// tolerant of trailing whitespace and a leading "code:" prefix.
+///
+/// Used by every entry path that doesn't have a richer input surface
+/// available: KMWARP_HEADLESS=1, the Windows service helper path,
+/// any non-Windows / non-tray client build, and the integration
+/// tests (via [`fixed_code_provider`]).
+pub fn stdin_code_provider() -> CodeProvider {
+    Box::new(|| Box::pin(async move { read_code_from_stdin().await }))
+}
+
+/// Test / scripted provider: returns the supplied code verbatim, no
+/// I/O. Useful for integration tests that drive the pairing flow
+/// without a real operator.
+#[cfg(test)]
+pub fn fixed_code_provider(code: impl Into<String>) -> CodeProvider {
+    let code = code.into();
+    Box::new(move || Box::pin(async move { Ok(code) }))
 }
 
 #[derive(Debug, Error)]
@@ -49,32 +125,34 @@ pub enum ClientPairingError {
     #[error("server rejected pairing (reason code {0})")]
     Rejected(u8),
 
-    #[error("could not read pairing code from stdin: {0}")]
-    StdinRead(#[from] std::io::Error),
+    /// The injected [`CodeProvider`] returned an error before yielding
+    /// a code — operator cancelled the dialog, stdin closed, etc.
+    /// Carries the provider's `anyhow::Error` formatted as a string
+    /// so this enum stays cheap to clone / serialize.
+    #[error("could not obtain pairing code from operator: {0}")]
+    CodeProvider(String),
 }
 
 /// Run the client-side pairing flow.
 ///
-/// On success the server's cert hash is written to `pin_store`.
-///
-/// `on_code` is invoked synchronously once the 6-digit code has been
-/// read from stdin. It exists so non-stdout UI surfaces (the Windows
-/// tray, primarily) can publish the code to the operator without
-/// scraping logs. Pass `None` when no extra publication is desired
-/// (headless runs, tests).
+/// `code_provider` is consumed exactly once; its returned future is
+/// awaited inline. On success the server's cert hash is written to
+/// `pin_store`.
 pub async fn run_client_pairing_flow(
     conn: &mut Connection,
     cert_der: &[u8],
     pin_store: &PinStore,
-    on_code: Option<&(dyn Fn(&str) + Send + Sync)>,
+    code_provider: CodeProvider,
 ) -> Result<(), ClientPairingError> {
     info!("entering client pairing mode (no peer.pin on disk yet)");
 
-    // 1. Prompt for the code.
-    let code = prompt_for_code().await?;
-    if let Some(cb) = on_code {
-        cb(&code);
-    }
+    // 1. Pull the code from whatever input surface the caller wired
+    //    up. The provider future may take seconds (user typing into a
+    //    dialog) or be instant (a fixed test provider); the pairing
+    //    flow doesn't care.
+    let code = (code_provider)()
+        .await
+        .map_err(|e| ClientPairingError::CodeProvider(format!("{e:#}")))?;
 
     // 2. Receive PairSpakeA from server.
     let msg_a = match conn.read_frame().await? {
@@ -168,9 +246,11 @@ pub async fn run_client_pairing_flow(
     }
 }
 
-/// Read a 6-digit pairing code from stdin. Tolerant of trailing
-/// whitespace and a leading "code:" prefix.
-async fn prompt_for_code() -> Result<String, ClientPairingError> {
+/// Internal: do the stdin read for [`stdin_code_provider`]. Tolerant
+/// of trailing whitespace and a leading "code:" prefix. Defers
+/// length / digit validation to [`ClientPairing::start`] (single
+/// source of truth: `PairingError::CodeMustBe6Digits`).
+async fn read_code_from_stdin() -> anyhow::Result<String> {
     use std::io::Write;
     {
         let mut out = std::io::stderr().lock();
@@ -189,9 +269,6 @@ async fn prompt_for_code() -> Result<String, ClientPairingError> {
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
-    // Defer length/digit validation to ClientPairing::start (it returns
-    // PairingError::CodeMustBe6Digits), so we only have one source of
-    // truth for the rule.
     Ok(trimmed)
 }
 
@@ -201,5 +278,25 @@ async fn send_reject(conn: &mut Connection, reason_code: u8) {
         .await
     {
         error!(error = %e, reason_code, "failed to send PairRejected; closing");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fixed_provider_returns_code() {
+        let provider = fixed_code_provider("123456");
+        let code = provider().await.expect("fixed provider never fails");
+        assert_eq!(code, "123456");
+    }
+
+    #[tokio::test]
+    async fn stdin_provider_is_constructible() {
+        // We can't drive stdin in a unit test, but constructing the
+        // provider shouldn't allocate I/O or block — proving the
+        // FnOnce shape is well-formed.
+        let _provider: CodeProvider = stdin_code_provider();
     }
 }

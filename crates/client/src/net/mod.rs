@@ -8,7 +8,10 @@ pub mod pairing;
 pub mod pump;
 
 pub use connection::{Connection, FrameReader, FrameWriter};
-pub use pairing::{run_client_pairing_flow, ClientPairingError};
+pub use pairing::{
+    run_client_pairing_flow, stdin_code_provider, ClientPairingError, CodeFuture, CodeProvider,
+    CodeProviderFactory,
+};
 #[cfg(target_os = "windows")]
 pub use pump::clipboard_out_task;
 pub use pump::{encoder_loop, injector_loop, injector_loop_with_source, FrameSource};

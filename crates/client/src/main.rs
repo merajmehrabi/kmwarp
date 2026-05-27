@@ -204,8 +204,14 @@ fn run_foreground() -> Result<()> {
 
     // Headless path: do the mDNS browse on main, then run the client
     // on a single tokio runtime hosted on main. Matches v1.0 shape.
+    // Default pairing input: stdin (the operator types into the
+    // terminal that launched the binary).
     let connect = resolve_connect_addr(None)?;
-    run_blocking_on_tokio(async move { run_client(connect, &peer_name, None).await })
+    let code_factory: kmwarp_client::net::CodeProviderFactory =
+        Box::new(|| kmwarp_client::net::stdin_code_provider());
+    run_blocking_on_tokio(
+        async move { run_client(connect, &peer_name, None, code_factory).await },
+    )
 }
 
 /// Build a multi-thread tokio runtime and `block_on` the supplied
@@ -297,13 +303,25 @@ fn run_with_tray(peer_name: String) -> Result<()> {
 
     // Worker thread owns the runtime + the client future. We don't
     // join — Quit calls process::exit which tears every thread down.
+    //
+    // Pairing input on the tray path: the native Win32 dialog from
+    // `platform::windows::pairing_dialog` (built in task #14 by the
+    // windows-tray agent). If that module isn't present yet (or the
+    // build is for a different feature set), we fall back to stdin —
+    // the binary still pairs, just via the launching terminal.
     let worker_peer_name = peer_name;
     let worker_status_tx = status_tx;
+    let code_factory: kmwarp_client::net::CodeProviderFactory =
+        build_windows_dialog_factory();
     thread::Builder::new()
         .name("kmwarp-runtime".into())
         .spawn(move || {
-            let result =
-                rt.block_on(run_client(connect, &worker_peer_name, Some(worker_status_tx)));
+            let result = rt.block_on(run_client(
+                connect,
+                &worker_peer_name,
+                Some(worker_status_tx),
+                code_factory,
+            ));
             if let Err(e) = result {
                 tracing::error!(error = %e, "run_client exited with error");
                 std::process::exit(1);
@@ -320,6 +338,31 @@ fn run_with_tray(peer_name: String) -> Result<()> {
 
     // Hands main thread to the Win32 message pump; never returns.
     tray::run_on_main_thread(status_rx, on_quit);
+}
+
+/// Build the [`CodeProviderFactory`] for the Windows tray run path.
+///
+/// Returns a factory that, on each pairing attempt, hands the
+/// pairing flow a fresh provider backed by
+/// [`platform::windows::pairing_dialog::ask_pairing_code`] — the
+/// native Win32 input dialog landed in task #14. The dialog runs on
+/// tokio's blocking pool so no runtime worker is parked while the
+/// user is typing.
+///
+/// Wrapping the underlying `async fn` in a `CodeProvider`
+/// (FnOnce returning a boxed future) keeps the dialog module
+/// self-contained — it doesn't need to know about the
+/// `CodeProvider` type alias — and lets the factory pattern live
+/// purely in main.rs.
+#[cfg(target_os = "windows")]
+fn build_windows_dialog_factory() -> kmwarp_client::net::CodeProviderFactory {
+    use kmwarp_client::platform::windows::pairing_dialog;
+    Box::new(|| {
+        Box::new(|| {
+            Box::pin(async move { pairing_dialog::ask_pairing_code().await })
+                as kmwarp_client::net::CodeFuture
+        })
+    })
 }
 
 // ──────────────────────────────────────────────────────────────────────
