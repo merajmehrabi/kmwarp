@@ -12,6 +12,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # rust-toolchain.toml pins 1.82 for local-dev reproducibility, but several
+  # transitive deps (clap_lex 1.1, hashbrown 0.17) require edition2024 which
+  # only stabilized in 1.85+. Env override wins over the toml pin.
+  RUSTUP_TOOLCHAIN: stable
 
 jobs:
   windows-msi:
