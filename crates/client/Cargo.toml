@@ -11,6 +11,14 @@ description = "kmwarp Windows client: receives input from a paired macOS server 
 name = "kmwarp-client"
 path = "src/main.rs"
 
+# cargo-wix MSI packaging — consumed by `cargo wix -p kmwarp-client`.
+# The hand-written installer template lives at crates/client/wix/main.wxs.
+# Do NOT run `cargo wix init`; it would clobber the template.
+[package.metadata.wix]
+name = "kmwarp-client"
+product-name = "kmwarp client"
+no-build = true
+
 [dependencies]
 kmwarp-core = { path = "../core" }
 

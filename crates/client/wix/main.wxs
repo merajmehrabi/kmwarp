@@ -1,0 +1,93 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!--
+  kmwarp-client MSI installer definition.
+
+  DO NOT CHANGE — UpgradeCode generated 2026-05-28 for kmwarp upgrade keying.
+  Changing the UpgradeCode breaks upgrades forever: new installs stop seeing
+  prior installs, both versions coexist in Add/Remove Programs, and uninstall
+  no longer removes the old binary.
+
+  Scope (v0.4.0): install kmwarp-client.exe to %ProgramFiles%\kmwarp\, add a
+  Start Menu shortcut, register an Add/Remove Programs entry. Windows Service
+  registration, auto-start on login, and Authenticode signing are out of
+  scope and tracked separately.
+
+  Preprocessor variables Version, CargoProfile, and CargoTargetBinDir are
+  supplied automatically by cargo-wix.
+-->
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <Product Id='*'
+             Name='kmwarp client'
+             UpgradeCode='8653FDBE-76BB-4B51-B4AE-5B3C7F4352C4'
+             Manufacturer='Meraj Mehrabi'
+             Language='1033'
+             Codepage='1252'
+             Version='$(var.Version)'>
+
+        <Package Id='*'
+                 Keywords='Installer'
+                 Description='kmwarp Windows client'
+                 Manufacturer='Meraj Mehrabi'
+                 InstallerVersion='450'
+                 Languages='1033'
+                 Compressed='yes'
+                 InstallScope='perMachine'
+                 SummaryCodepage='1252'/>
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes'/>
+
+        <Property Id='ARPHELPLINK' Value='https://github.com/merajmehrabi/kmwarp'/>
+        <Property Id='ARPURLINFOABOUT' Value='https://github.com/merajmehrabi/kmwarp'/>
+        <Property Id='ARPNOREPAIR' Value='yes' Secure='yes'/>
+        <Property Id='ARPNOMODIFY' Value='yes' Secure='yes'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='ProgramFiles64Folder'>
+                <Directory Id='APPLICATIONFOLDER' Name='kmwarp'>
+                    <Component Id='ClientExe' Guid='*' Win64='yes'>
+                        <File Id='ClientExe'
+                              Name='kmwarp-client.exe'
+                              DiskId='1'
+                              Source='$(var.CargoTargetBinDir)\kmwarp-client.exe'
+                              KeyPath='yes'/>
+                    </Component>
+                </Directory>
+            </Directory>
+
+            <Directory Id='ProgramMenuFolder'>
+                <Directory Id='ApplicationProgramsFolder' Name='kmwarp'>
+                    <Component Id='StartMenuShortcut' Guid='*'>
+                        <Shortcut Id='ClientShortcut'
+                                  Name='kmwarp client'
+                                  Description='kmwarp Windows client (tray)'
+                                  Target='[APPLICATIONFOLDER]kmwarp-client.exe'
+                                  Arguments='run'
+                                  WorkingDirectory='APPLICATIONFOLDER'/>
+                        <RemoveFolder Id='RemoveApplicationProgramsFolder' On='uninstall'/>
+                        <RegistryValue Root='HKCU'
+                                       Key='Software\kmwarp\client'
+                                       Name='installed'
+                                       Type='integer'
+                                       Value='1'
+                                       KeyPath='yes'/>
+                    </Component>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature Id='Default' Title='kmwarp client' Level='1' ConfigurableDirectory='APPLICATIONFOLDER'>
+            <ComponentRef Id='ClientExe'/>
+            <ComponentRef Id='StartMenuShortcut'/>
+        </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+
+        <UIRef Id='WixUI_Minimal'/>
+
+    </Product>
+</Wix>
