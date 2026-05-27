@@ -55,6 +55,11 @@ time = { version = "0.3", default-features = false, features = ["std", "macros"]
 # Paths
 directories = "5"
 
+# mDNS service discovery (v1.1) — pure Rust, no avahi/bonjour
+# system deps. Used by both server (register `_kmwarp._tcp.local.`)
+# and client (browse for the server when KMWARP_CONNECT is unset).
+mdns-sd = "0.13"
+
 # Test deps
 proptest = "1"
 

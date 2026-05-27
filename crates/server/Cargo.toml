@@ -40,6 +40,7 @@ directories = { workspace = true }
 subtle = { workspace = true }
 time = { workspace = true }
 clap = { workspace = true }
+mdns-sd = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 async-trait = { workspace = true }

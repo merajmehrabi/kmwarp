@@ -6,6 +6,7 @@
 //! LaunchAgent helper can link against it without rebuilding a binary.
 
 pub mod app;
+pub mod discovery;
 pub mod error;
 pub mod net;
 pub mod platform;

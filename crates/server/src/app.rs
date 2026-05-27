@@ -270,6 +270,29 @@ pub async fn run_server(
         ServerStatus::Listening { addr: local_addr },
     );
 
+    // v1.1: register `_kmwarp._tcp.local.` so a fresh `kmwarp-client`
+    // can find us without a manual KMWARP_CONNECT. mDNS is a
+    // convenience layer — failure here is non-fatal; we just log and
+    // keep listening. The handle is bound to a local var so it
+    // outlives the accept loop (Drop = unregister).
+    let _mdns = match crate::discovery::register(peer_name, local_addr) {
+        Ok(adv) => {
+            info!(
+                fullname = adv.fullname(),
+                "mDNS advertisement active; clients on the LAN can discover this server"
+            );
+            Some(adv)
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "mDNS registration failed; continuing without auto-discovery \
+                 (clients must set KMWARP_CONNECT manually)"
+            );
+            None
+        }
+    };
+
     let peer_name: Arc<str> = Arc::from(peer_name);
     let mod_remap: Arc<kmwarp_core::modmap::ModRemap> = Arc::new(load_mod_remap_or_default());
     let cert_bundle = Arc::new(cert_bundle);
